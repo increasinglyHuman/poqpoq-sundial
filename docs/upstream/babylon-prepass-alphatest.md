@@ -1,6 +1,6 @@
 # Babylon bug: `needDepthPrePass` ignores alpha test on StandardMaterial with `MATERIAL_ALPHATEST`
 
-**Status:** draft for Allen's approval. Not posted.
+**Status:** posted by Allen, 2026-09-21: [forum thread](https://forum.babylonjs.com/t/standardmaterial-needdepthprepass-writes-whole-quad-depth-when-transparencymode-material-alphatest/64133) · [Playground #G5C5KQ#1](https://playground.babylonjs.com/#G5C5KQ#1). No reply yet. We offered a PR; wait for a maintainer to say which shape they want before opening one.
 **Verified on:** Babylon.js 9.17.1, WebGL2 (GLSL) and WebGPU (WGSL), Chrome, RTX 5060.
 **Local repro:** `npm run dev`, then `/repro.html?engine=webgl2|webgpu&prepass=0|1&fix=0|1`.
 
