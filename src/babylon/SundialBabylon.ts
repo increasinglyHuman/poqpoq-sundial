@@ -26,6 +26,9 @@ import { COMMON_WGSL, RECEIVER_WGSL } from "../core/wgsl";
 
 const MAX_LIGHTS = 4;
 
+/** Collapses an instance to a point: it casts nothing. */
+const ZERO_MATRIX = new Float32Array(16);
+
 /**
  * Babylon creates its main depth buffer as a render attachment only. Page
  * marking reads it from compute, so add TEXTURE_BINDING when Babylon creates
@@ -61,6 +64,12 @@ export interface CasterOptions {
   /** Alpha-tested caster: layer registered with `setAlphaMask`. */
   alphaLayer?: number;
   alphaCutoff?: number;
+  /**
+   * Dynamic thin-instanced casters: instance slots to reserve, so the
+   * thin-instance count can grow up to this at runtime. Defaults to the count
+   * at registration. Instances beyond it do not cast (warned once).
+   */
+  capacity?: number;
 }
 
 interface DynamicCaster {
@@ -159,7 +168,13 @@ export class SundialBabylon {
       uvs: uvs ? new Float32Array(uvs) : undefined,
       alpha: opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined,
     });
-    const matrices = casterMatrices(mesh);
+    let matrices = casterMatrices(mesh);
+    if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
+      // Reserved slots start as zero matrices, which cast nothing.
+      const padded = new Float32Array(opts.capacity * 16);
+      padded.set(matrices);
+      matrices = padded;
+    }
     const group = this.core.addInstances(geometry, matrices, !!opts.dynamic);
     if (opts.dynamic) this.dynamics.push({ mesh, group, last: matrices.slice() });
     return group;
@@ -227,31 +242,36 @@ export class SundialBabylon {
 
   /**
    * Re-read every dynamic caster's instance matrices and upload the ones that
-   * moved. Thin-instanced casters are tracked per instance (review F2); a
-   * changed thin-instance count is not supported and is reported once.
+   * moved. Thin-instanced casters are tracked per instance (review F2). The
+   * thin-instance count may change at runtime within the registered capacity:
+   * instances that disappear are collapsed to a zero matrix, which casts
+   * nothing and invalidates their old footprint, and they reappear
+   * automatically if the count grows back (PR #3 review F1). Growth beyond
+   * the capacity is reported once; those instances do not cast.
    */
   private updateDynamics(): void {
     for (const d of this.dynamics) {
       const now = casterMatrices(d.mesh, this.scratchMatrices);
       this.scratchMatrices = now;
-      const count = Math.min(d.group.count, now.length / 16);
-      if (now.length / 16 !== d.group.count && !d.warnedCount) {
+      const live = now.length / 16;
+      const slots = d.group.count;
+      if (live > slots && !d.warnedCount) {
         d.warnedCount = true;
-        console.warn(`Sundial: ${d.mesh.name} changed thin-instance count (${d.group.count} → ${now.length / 16}); only the first ${count} are tracked`);
+        console.warn(`Sundial: ${d.mesh.name} has ${live} thin instances but ${slots} registered slots; the extra instances do not cast. Pass { capacity } to addCaster.`);
       }
-      for (let i = 0; i < count; i++) {
+      for (let i = 0; i < slots; i++) {
         const o = i * 16;
+        const next = i < live ? now.subarray(o, o + 16) : ZERO_MATRIX;
         let moved = false;
         for (let k = 0; k < 16; k++) {
-          if (now[o + k] !== d.last[o + k]) {
+          if (next[k] !== d.last[o + k]) {
             moved = true;
             break;
           }
         }
         if (moved) {
-          const m = now.subarray(o, o + 16);
-          d.last.set(m, o);
-          this.core.setInstanceMatrix(d.group, i, m);
+          d.last.set(next, o);
+          this.core.setInstanceMatrix(d.group, i, next);
         }
       }
     }

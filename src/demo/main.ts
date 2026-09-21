@@ -130,7 +130,7 @@ async function main() {
     for (let i = 0; i < 4; i++) mats.set(Matrix.Translation(-30 + i * 4, world.heightAt(-30 + i * 4, -8) + 3, -8).m, i * 16);
     pillar.thinInstanceSetBuffer("matrix", mats, 16, false);
     pillar.receiveShadows = true;
-    const group = sundial.addCaster(pillar, { dynamic: true });
+    const group = sundial.addCaster(pillar, { dynamic: true, capacity: 6 });
     thinMover = { mesh: pillar, group };
     scene.onBeforeRenderObservable.add(() => {
       const t = performance.now() / 1000;
