@@ -64,9 +64,50 @@ export interface CasterOptions {
 }
 
 interface DynamicCaster {
-  mesh: AbstractMesh;
+  mesh: Mesh;
   group: InstanceGroup;
+  /** 16 floats per instance: the final world matrices last uploaded. */
   last: Float32Array;
+  warnedCount?: boolean;
+}
+
+/**
+ * What produced the depth buffer: captured right after the main camera
+ * renders, used by the next frame's page marking. The scene's transform
+ * matrix cannot stand in for it, because Babylon rewrites that matrix for
+ * every camera and render target it renders (review F1).
+ */
+interface DepthSnapshot {
+  texture: GPUTexture;
+  invViewProj: Float32Array;
+}
+
+/**
+ * Final world matrices of a mesh's instances: thin-instance × mesh world, or
+ * the mesh world alone. Reads the thin-instance buffer Babylon renders from.
+ * `thinInstanceGetWorldMatrices()` cannot be used: it builds its Matrix
+ * objects once and caches them, so edits made through the buffer plus
+ * `thinInstanceBufferUpdated()` never show up there.
+ */
+function casterMatrices(mesh: Mesh, out?: Float32Array): Float32Array {
+  const world = mesh.computeWorldMatrix(true);
+  const count = mesh.thinInstanceCount;
+  const data = (mesh as unknown as { _thinInstanceDataStorage?: { matrixData?: Float32Array | null } })
+    ._thinInstanceDataStorage?.matrixData;
+  if (count > 0 && data) {
+    const result = out && out.length === count * 16 ? out : new Float32Array(count * 16);
+    const local = new Matrix();
+    const tmp = new Matrix();
+    for (let i = 0; i < count; i++) {
+      Matrix.FromArrayToRef(data, i * 16, local);
+      local.multiplyToRef(world, tmp);
+      result.set(tmp.m, i * 16);
+    }
+    return result;
+  }
+  const result = out && out.length === 16 ? out : new Float32Array(16);
+  result.set(world.m);
+  return result;
 }
 
 export class SundialBabylon {
@@ -83,8 +124,10 @@ export class SundialBabylon {
   private readonly dynamics: DynamicCaster[] = [];
   private readonly plugins: SundialPlugin[] = [];
   private observer: Observer<Scene> | null = null;
-  private readonly invViewProj = new Matrix();
-  private hasRendered = false;
+  private afterCameraObserver: Observer<Camera> | null = null;
+  private depthSnapshot: DepthSnapshot | null = null;
+  private readonly scratch = new Matrix();
+  private scratchMatrices: Float32Array = new Float32Array(0);
 
   constructor(scene: Scene, light: DirectionalLight, options: PagedShadowOptions) {
     this.scene = scene;
@@ -116,21 +159,9 @@ export class SundialBabylon {
       uvs: uvs ? new Float32Array(uvs) : undefined,
       alpha: opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined,
     });
-    const world = mesh.computeWorldMatrix(true);
-    let matrices: Float32Array;
-    if (mesh.thinInstanceCount > 0) {
-      const thin = mesh.thinInstanceGetWorldMatrices();
-      matrices = new Float32Array(thin.length * 16);
-      const tmp = new Matrix();
-      thin.forEach((m, i) => {
-        m.multiplyToRef(world, tmp);
-        matrices.set(tmp.m, i * 16);
-      });
-    } else {
-      matrices = new Float32Array(world.m);
-    }
+    const matrices = casterMatrices(mesh);
     const group = this.core.addInstances(geometry, matrices, !!opts.dynamic);
-    if (opts.dynamic) this.dynamics.push({ mesh, group, last: new Float32Array(world.m) });
+    if (opts.dynamic) this.dynamics.push({ mesh, group, last: matrices.slice() });
     return group;
   }
 
@@ -149,6 +180,7 @@ export class SundialBabylon {
   start(): void {
     this.core.build();
     this.observer = this.scene.onBeforeRenderObservable.add(() => this.update());
+    this.afterCameraObserver = this.scene.onAfterCameraRenderObservable.add((camera) => this.captureDepth(camera));
   }
 
   setEnabled(on: boolean): void {
@@ -160,39 +192,69 @@ export class SundialBabylon {
 
   dispose(): void {
     this.observer?.remove();
+    this.afterCameraObserver?.remove();
+  }
+
+  /** Snapshot what the main camera's depth buffer was rendered with (review F1). */
+  private captureDepth(camera: Camera): void {
+    if (camera !== this.scene.activeCamera) return;
+    const depth = (this.scene.getEngine() as unknown as { _depthTexture?: GPUTexture })._depthTexture;
+    if (!depth) return;
+    camera.getTransformationMatrix().invertToRef(this.scratch);
+    this.depthSnapshot = { texture: depth, invViewProj: new Float32Array(this.scratch.m) };
   }
 
   private update(): void {
     if (!this.enabled) return;
-    for (const d of this.dynamics) {
-      const m = d.mesh.computeWorldMatrix(true).m;
-      let moved = false;
-      for (let i = 0; i < 16; i++) {
-        if (m[i] !== d.last[i]) {
-          moved = true;
-          break;
-        }
-      }
-      if (moved) {
-        d.last.set(m);
-        this.core.setInstanceMatrix(d.group, 0, m as unknown as Float32Array);
-      }
-    }
+    this.updateDynamics();
     const camera = this.scene.activeCamera as Camera;
     const eye = camera.globalPosition;
     const dir = this.light.direction;
     const engine = this.scene.getEngine() as WebGPUEngine;
-    const depth = (engine as unknown as { _depthTexture?: GPUTexture })._depthTexture;
-    // The depth buffer still holds the previous frame, and the scene's
-    // transform is still the one it was rendered with.
-    this.scene.getTransformMatrix().invertToRef(this.invViewProj);
+    const current = (engine as unknown as { _depthTexture?: GPUTexture })._depthTexture;
+    // Mark only from a depth buffer we saw rendered, with the matrix it was
+    // rendered with. After a resize Babylon has a fresh, empty depth texture:
+    // skip marking for that one frame rather than mark garbage.
+    const snap = this.depthSnapshot;
+    const depth = snap && snap.texture === current ? { texture: snap.texture, invViewProj: snap.invViewProj } : undefined;
     this.core.update({
       eye: [eye.x, eye.y, eye.z],
       lightDir: [dir.x, dir.y, dir.z],
       pixelWorldSizeAt1m: (2 * Math.tan(camera.fov / 2)) / engine.getRenderHeight(),
-      depth: depth && this.hasRendered ? { texture: depth, invViewProj: this.invViewProj.m } : undefined,
+      depth,
     });
-    this.hasRendered = true;
+  }
+
+  /**
+   * Re-read every dynamic caster's instance matrices and upload the ones that
+   * moved. Thin-instanced casters are tracked per instance (review F2); a
+   * changed thin-instance count is not supported and is reported once.
+   */
+  private updateDynamics(): void {
+    for (const d of this.dynamics) {
+      const now = casterMatrices(d.mesh, this.scratchMatrices);
+      this.scratchMatrices = now;
+      const count = Math.min(d.group.count, now.length / 16);
+      if (now.length / 16 !== d.group.count && !d.warnedCount) {
+        d.warnedCount = true;
+        console.warn(`Sundial: ${d.mesh.name} changed thin-instance count (${d.group.count} → ${now.length / 16}); only the first ${count} are tracked`);
+      }
+      for (let i = 0; i < count; i++) {
+        const o = i * 16;
+        let moved = false;
+        for (let k = 0; k < 16; k++) {
+          if (now[o + k] !== d.last[o + k]) {
+            moved = true;
+            break;
+          }
+        }
+        if (moved) {
+          const m = now.subarray(o, o + 16);
+          d.last.set(m, o);
+          this.core.setInstanceMatrix(d.group, i, m);
+        }
+      }
+    }
   }
 }
 
