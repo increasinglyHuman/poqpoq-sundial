@@ -87,10 +87,13 @@ prepass variant only. PBR, and StandardMaterial on the legacy
 1. **Receivers must not write.** A storage write in a material shader, even
    one that never executes, disables early-Z for the whole draw: +13 ms in the
    forest. Page requests come from the mark pass over camera depth instead.
-2. **Skip the receiver for alpha-test-discarded texels.** Tint lowers
-   `discard` to demote-to-helper, so discarded leaf-card texels still run the
-   whole shader. Guarding the receiver on the material's own alpha test took
-   the village view from 30.5 to single-digit ms.
+2. **Alpha-test before the expensive work.** StandardMaterial with
+   `transparencyMode = MATERIAL_ALPHATEST` discards at the *end* of the
+   shader, after all lighting, so every transparent leaf texel paid for the
+   full receiver first. Guarding the receiver on the alpha test took the
+   village view from 24 to 6.8 ms. (An earlier explanation, Tint's
+   demote-to-helper, was wrong: on the legacy early-discard path, gating
+   measured no gain at all, on either GPU.)
 3. **PCF without arrays.** 3×3 bilinear PCF over a 4×4 footprint collapses to
    separable weights (1−f, 1, 1, f); a dynamically indexed 4×4 array spilled on
    Intel and cost ~45 ms.
