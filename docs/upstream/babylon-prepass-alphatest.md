@@ -24,31 +24,50 @@
 >
 > Caveat: at that point `alpha` includes the diffuse-texture alpha but not contributions applied later (for example an opacity texture), so a complete fix would compute alpha fully before the prepass exit. We're working around it with a small material plugin that injects the test above at `CUSTOM_FRAGMENT_UPDATE_ALPHA`, and would be glad to open a PR if you tell us which shape you prefer.
 
-## Playground snippet
+## Playground snippet (ES module)
 
-Paste into https://playground.babylonjs.com (WebGL2 by default; switch the engine to WebGPU to see the same result).
+For the current Playground's ES-module mode. The entry file exports
+`createScene`, which the Playground calls as `createScene(engine, canvas)`
+(it also accepts a default export or a `Playground` class with a static
+`CreateScene`). Bare `@babylonjs/core` imports resolve to the Playground's own
+Babylon build. Switch the engine between WebGL2 and WebGPU to see the same
+result on both.
 
 ```js
-const createScene = function () {
-    const scene = new BABYLON.Scene(engine);
-    scene.clearColor = new BABYLON.Color4(0.1, 0.1, 0.15, 1);
-    const camera = new BABYLON.FreeCamera("cam", new BABYLON.Vector3(0, 0, -4), scene);
-    camera.setTarget(BABYLON.Vector3.Zero());
+import {
+    Color3,
+    Color4,
+    DynamicTexture,
+    FreeCamera,
+    HemisphericLight,
+    Material,
+    MeshBuilder,
+    Scene,
+    StandardMaterial,
+    Vector3,
+} from "@babylonjs/core";
+
+export const createScene = (engine, canvas) => {
+    const scene = new Scene(engine);
+    scene.clearColor = new Color4(0.1, 0.1, 0.15, 1);
+
+    const camera = new FreeCamera("cam", new Vector3(0, 0, -4), scene);
+    camera.setTarget(Vector3.Zero());
     camera.attachControl(canvas, true);
-    new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, -1), scene);
+    new HemisphericLight("light", new Vector3(0, 1, -1), scene);
 
     // Behind: an opaque red wall, drawn after the quad.
-    const wall = BABYLON.MeshBuilder.CreatePlane("wall", { size: 3 }, scene);
+    const wall = MeshBuilder.CreatePlane("wall", { size: 3 }, scene);
     wall.position.z = 1;
-    const wallMat = new BABYLON.StandardMaterial("wallMat", scene);
-    wallMat.diffuseColor = new BABYLON.Color3(1, 0.1, 0.1);
-    wallMat.emissiveColor = new BABYLON.Color3(0.6, 0.05, 0.05);
+    const wallMat = new StandardMaterial("wallMat", scene);
+    wallMat.diffuseColor = new Color3(1, 0.1, 0.1);
+    wallMat.emissiveColor = new Color3(0.6, 0.05, 0.05);
     wall.material = wallMat;
     wall.renderingGroupId = 1;
     scene.setRenderingAutoClearDepthStencil(1, false);
 
     // In front: an alpha-tested quad (a green disc on a transparent square).
-    const tex = new BABYLON.DynamicTexture("disc", { width: 256, height: 256 }, scene, true);
+    const tex = new DynamicTexture("disc", { width: 256, height: 256 }, scene, true);
     const g = tex.getContext();
     g.clearRect(0, 0, 256, 256);
     g.fillStyle = "#2c2";
@@ -58,11 +77,11 @@ const createScene = function () {
     tex.update();
     tex.hasAlpha = true;
 
-    const quad = BABYLON.MeshBuilder.CreatePlane("quad", { size: 2 }, scene);
-    const mat = new BABYLON.StandardMaterial("quadMat", scene);
+    const quad = MeshBuilder.CreatePlane("quad", { size: 2 }, scene);
+    const mat = new StandardMaterial("quadMat", scene);
     mat.diffuseTexture = tex;
     mat.useAlphaFromDiffuseTexture = true;
-    mat.transparencyMode = BABYLON.Material.MATERIAL_ALPHATEST;
+    mat.transparencyMode = Material.MATERIAL_ALPHATEST;
     mat.alphaCutOff = 0.5;
     mat.needDepthPrePass = true; // set false: the red wall shows around the disc, as expected
     quad.material = mat;
@@ -71,6 +90,10 @@ const createScene = function () {
     return scene;
 };
 ```
+
+In a TypeScript playground, type the parameters:
+`export const createScene = (engine: AbstractEngine, canvas: HTMLCanvasElement) => { … }`
+and add `AbstractEngine` to the import (as `import type`).
 
 **Expected:** the red wall visible all around the green disc.
 **Actual (with `needDepthPrePass = true`):** a square hole, the quad's transparent area, cut through the wall.
