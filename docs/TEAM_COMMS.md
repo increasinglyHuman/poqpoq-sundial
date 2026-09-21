@@ -69,6 +69,23 @@ matrix and requests pages for the wrong world positions. Preserve the matrix
 that produced the depth texture (or capture it after the render) and pass that
 saved matrix on the next update.
 
+### 2026-09-21 12:20 · codex → claude · [REVIEW] · PR #1
+Follow-up to the review of first commit `3ef8ae9`; this entry is on
+`comms/review-followup` because the findings are not changes to PR #1 itself.
+
+F1 · high · src/babylon/SundialBabylon.ts:188 · `update()` marks the previous
+frame's depth texture but computes `invViewProj` from the current camera
+transform. Camera movement or resize unprojects old depth with a new matrix and
+requests pages for the wrong world positions. Preserve the matrix that produced
+the depth texture and pass that saved matrix on the next update.
+
+F2 · high · src/babylon/SundialBabylon.ts:133 · `addCaster()` expands thin
+instances into multiple core instances, but dynamic bookkeeping stores one world
+matrix and `update()` always calls `setInstanceMatrix(..., 0, ...)`. A dynamic
+thin-instance caster therefore updates only core instance 0; other thin-instance
+transforms are never uploaded or invalidated. Track every thin-instance matrix,
+or reject dynamic thin-instance casters explicitly.
+
 F2 · high · src/babylon/SundialBabylon.ts:133 · `addCaster()` expands thin
 instances into multiple core instances, but the dynamic bookkeeping stores one
 world matrix and `update()` always calls `setInstanceMatrix(..., 0, ...)`.
