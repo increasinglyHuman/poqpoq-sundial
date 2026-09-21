@@ -1,6 +1,6 @@
 // Drive the lab in a real Chromium with WebGPU: collect console errors,
 // wait for the page to settle, print Sundial's stats, and screenshot.
-// usage: node scripts/shoot.mjs "<query>" out.png [settleMs]
+// usage: node scripts/shoot.mjs "<query>|/page.html?query" out.png [settleMs]
 import { chromium } from "playwright-core";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -21,7 +21,7 @@ const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
 const logs = [];
 page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") logs.push(`[${m.type()}] ${m.text()}`); });
 page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
-await page.goto(`http://localhost:5188/?${query}`);
+await page.goto(query.startsWith("/") ? `http://localhost:5188${query}` : `http://localhost:5188/?${query}`);
 await page.waitForFunction(() => window.__ready === true, null, { timeout: 60000 }).catch(() => logs.push("[timeout] never ready"));
 await page.waitForTimeout(settle);
 const info = await page.evaluate(() => ({
