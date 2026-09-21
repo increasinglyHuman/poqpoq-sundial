@@ -11,6 +11,43 @@ npm run dev            # http://localhost:5188
 node scripts/bench.mjs # interleaved A/B on whatever GPU Chrome picks
 ```
 
+## Using the package
+
+`@poqpoq/sundial` is built like World's other sibling packages
+(`@poqpoq/dozer`, `kudzu`, `paths`): an ES module plus type declarations in
+`dist/`, with `@babylonjs/core` as a peer. Build it, then depend on it by path:
+
+```
+npm run build                       # → dist/index.js (core), dist/babylon.js (adapter)
+# in the consuming app's package.json:
+"@poqpoq/sundial": "file:../poqpoq-virtualShadowMapper/lab"
+```
+
+The consumer should dedupe Babylon (`resolve.dedupe: ["@babylonjs/core"]` in
+Vite), as World already does for its file-linked packages.
+
+```ts
+import { SundialBabylon } from "@poqpoq/sundial/babylon";
+
+// Importing is safe on every backend. Only construct on WebGPU;
+// keep the existing CascadedShadowGenerator on WebGL2.
+if (SundialBabylon.isSupported(engine)) {
+  const sundial = new SundialBabylon(scene, sun, { sceneMin: [-128, -10, -128], sceneMax: [128, 60, 128] });
+  sundial.addCaster(terrain);                                       // static
+  sundial.setAlphaMask(0, leafMaskCanvas, 0.5);
+  sundial.addCaster(leaves, { alphaLayer: 0, alphaCutoff: 0.5 });   // thin instances included
+  sundial.addCaster(windmill, { dynamic: true });                   // re-read every frame
+  sundial.addCaster(swarm, { dynamic: true, capacity: 64 });        // thin-instance count may vary up to 64
+  sundial.addReceivers(materials);                                  // meshes also need receiveShadows
+  sundial.start();
+}
+```
+
+Don't also attach a shadow generator to the same light. `npm run test:consumer`
+builds the package, installs it into `test/consumer/` exactly as above, and
+checks in real Chrome that the import is harmless on WebGL2 and that shadows
+run on WebGPU.
+
 URL knobs: `mode=sundial|csm|off`, `tier=medium|high`, `el`, `az`, `speed`
 (sun °/s), `debug=1` (tint by level), `lodBias`, `budget`, `stride`,
 `cam=x,y,z,tx,ty,tz`, `animate=0`, `trees=N`, `rx=onetap|bilinear|nolookup`

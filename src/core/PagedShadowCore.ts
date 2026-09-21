@@ -124,9 +124,12 @@ const normalize = (a: Vec3): Vec3 => {
   return [a[0] / l, a[1] / l, a[2] / l];
 };
 
-const STORAGE = GPUBufferUsage.STORAGE;
-const COPY_DST = GPUBufferUsage.COPY_DST;
-const COPY_SRC = GPUBufferUsage.COPY_SRC;
+// GPUBufferUsage values from the WebGPU spec, as literals: reading the
+// GPUBufferUsage global at module load would throw in any browser without
+// WebGPU, and World imports this package on every backend.
+const STORAGE = 0x0080;
+const COPY_DST = 0x0008;
+const COPY_SRC = 0x0004;
 
 export class PagedShadowCore {
   readonly device: GPUDevice;
