@@ -5,7 +5,8 @@ import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { CascadedShadowGenerator } from "@babylonjs/core/Lights/Shadows/cascadedShadowGenerator";
 import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
-import { Vector3 } from "@babylonjs/core/Maths/math.vector";
+import { Matrix, Vector3 } from "@babylonjs/core/Maths/math.vector";
+import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import "@babylonjs/core"; // the demo pulls in every engine extension; the adapter does not need to
 import { SundialBabylon } from "../babylon/SundialBabylon";
@@ -119,6 +120,24 @@ async function main() {
   for (const m of world.movers) {
     m.update(0);
     sundial.addCaster(m.mesh, { dynamic: true });
+  }
+  // ?thinmover=1: a dynamic THIN-INSTANCED caster (four pillars, the third
+  // bobbing), the case review F2 found unsupported.
+  let thinMover: { mesh: Mesh; group: unknown } | null = null;
+  if (q.get("thinmover") === "1") {
+    const pillar = MeshBuilder.CreateBox("thinPillars", { width: 1, height: 6, depth: 1 }, scene);
+    const mats = new Float32Array(4 * 16);
+    for (let i = 0; i < 4; i++) mats.set(Matrix.Translation(-30 + i * 4, world.heightAt(-30 + i * 4, -8) + 3, -8).m, i * 16);
+    pillar.thinInstanceSetBuffer("matrix", mats, 16, false);
+    pillar.receiveShadows = true;
+    const group = sundial.addCaster(pillar, { dynamic: true, capacity: 6 });
+    thinMover = { mesh: pillar, group };
+    scene.onBeforeRenderObservable.add(() => {
+      const t = performance.now() / 1000;
+      mats.set(Matrix.Translation(-22, world.heightAt(-22, -8) + 3 + Math.sin(t * 2) * 2.5, -8).m, 2 * 16);
+      pillar.thinInstanceBufferUpdated("matrix");
+    });
+    scene.onBeforeRenderObservable.makeObserverTopPriority(scene.onBeforeRenderObservable.observers[scene.onBeforeRenderObservable.observers.length - 1]);
   }
   sundial.addReceivers(world.materials);
   sundial.core.tuning.debugMode = q.get("debug") === "1" ? 1 : 0;
@@ -295,7 +314,8 @@ async function main() {
   };
 
   (window as unknown as Record<string, unknown>).sundial = {
-    bench, sundial, scene, engine, state, setMode, stats: () => sundial.core.stats };
+    bench,
+    thinMover: () => thinMover, sundial, scene, engine, state, setMode, stats: () => sundial.core.stats };
   engine.runRenderLoop(() => scene.render());
   window.addEventListener("resize", () => engine.resize());
   (window as unknown as Record<string, unknown>).__ready = true;

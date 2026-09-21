@@ -109,6 +109,9 @@ prepass variant only. PBR, and StandardMaterial on the legacy
 - `engine._depthTexture` plus a `createTexture` patch that adds
   `TEXTURE_BINDING` to Babylon's main depth buffer, so marking can read it.
   The one real patch; an upstream option would retire it.
+- `_thinInstanceDataStorage.matrixData` — the thin-instance buffer Babylon
+  renders from. The public `thinInstanceGetWorldMatrices()` caches its
+  matrices on first call and goes stale after buffer edits.
 - `wrapWebGPUTexture` (public) for the pool; `WebGPUDataBuffer` for storage
   buffer bindings.
 
