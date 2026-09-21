@@ -1,0 +1,27 @@
+# dependencies and build output
+node_modules/
+dist/
+.vite/
+
+# local run artefacts
+shots/
+*.log
+*.png
+!docs/**/*.png
+
+# secrets and machine config — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_*
+.npmrc
+
+# editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,14 @@
+import { chromium } from "playwright-core";
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+const root = join(process.env.LOCALAPPDATA, "ms-playwright");
+const dir = readdirSync(root).filter((d) => /^chromium-\d+$/.test(d)).sort().pop();
+const exe = [join(root, dir, "chrome-win64", "chrome.exe"), join(root, dir, "chrome-win", "chrome.exe")].find(existsSync);
+const browser = await chromium.launch({ executablePath: exe, headless: false, args: ["--enable-unsafe-webgpu"] });
+const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+await page.goto(`http://localhost:5188/?${process.argv[2] ?? ""}`);
+await page.waitForFunction(() => window.__ready === true, null, { timeout: 60000 });
+await page.waitForTimeout(2500);
+const out = await page.evaluate(new Function("return (" + (process.argv[3] ?? "() => null") + ")()"));
+console.log(typeof out === "string" ? out : JSON.stringify(out, null, 1));
+await browser.close();

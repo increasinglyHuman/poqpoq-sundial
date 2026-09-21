@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sundial Shadows Lab</title>
+    <style>
+      :root { --panel: rgba(12, 16, 22, 0.78); --ink: #e8edf3; --dim: #8fa0b3; --accent: #f5c46b; }
+      html, body { margin: 0; height: 100%; background: #0b0e12; color: var(--ink); overflow: hidden;
+        font: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+      #view { width: 100vw; height: 100vh; display: block; outline: none; }
+      #hud { position: fixed; top: 12px; left: 12px; background: var(--panel); padding: 12px 14px;
+        border-radius: 8px; backdrop-filter: blur(6px); max-width: min(420px, calc(100vw - 48px)); }
+      #hud h1 { font-size: 13px; margin: 0 0 8px; letter-spacing: 0.08em; color: var(--accent); }
+      #stats { white-space: pre; margin: 0 0 10px; }
+      .row { display: flex; gap: 6px; align-items: center; margin: 4px 0; flex-wrap: wrap; }
+      .row label { width: 92px; color: var(--dim); }
+      .row input[type=range] { flex: 1; min-width: 120px; }
+      button { background: #1f2833; color: var(--ink); border: 1px solid #334155; border-radius: 5px;
+        padding: 3px 9px; font: inherit; cursor: pointer; }
+      button.on { background: var(--accent); color: #111; border-color: var(--accent); }
+      .hint { color: var(--dim); margin-top: 6px; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="hud">
+      <h1>SUNDIAL · paged sun shadows</h1>
+      <pre id="stats">starting WebGPU…</pre>
+      <div class="row"><label>shadows</label>
+        <button data-mode="sundial">Sundial</button><button data-mode="csm">CSM</button><button data-mode="off">off</button>
+        <button data-tier="medium" title="CSM 3×2048²">med</button><button data-tier="high" title="CSM 4×4096²">high</button>
+      </div>
+      <div class="row"><label>sun elevation</label><input id="el" type="range" min="3" max="85" step="0.1" /></div>
+      <div class="row"><label>sun azimuth</label><input id="az" type="range" min="0" max="360" step="0.1" /></div>
+      <div class="row"><label>sun speed °/s</label><input id="speed" type="range" min="0" max="6" step="0.05" /></div>
+      <div class="row"><label>band L0 °</label><input id="band" type="range" min="0.005" max="0.5" step="0.005" /></div>
+      <div class="row"><label>lod bias</label><input id="lod" type="range" min="-1" max="3" step="0.25" /></div>
+      <div class="row"><label>debug levels</label><input id="debug" type="checkbox" /></div>
+      <div class="hint">WASD + drag to move · URL: ?mode=csm&amp;tier=high&amp;el=12&amp;speed=1</div>
+    </div>
+    <script type="module" src="/src/demo/main.ts"></script>
+  </body>
+</html>
