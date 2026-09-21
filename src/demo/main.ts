@@ -9,6 +9,7 @@ import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import "@babylonjs/core"; // the demo pulls in every engine extension; the adapter does not need to
 import { SundialBabylon } from "../babylon/SundialBabylon";
+import { DepthPrePassAlphaTestFix } from "../babylon/DepthPrePassAlphaTestFix";
 import { buildWorld, SIM } from "./world";
 
 type Mode = "sundial" | "csm" | "off";
@@ -88,6 +89,16 @@ async function main() {
 
   const treeCount = num("trees", 1400);
   const world = buildWorld(scene, treeCount);
+
+  // Depth prepass experiment. Babylon's needDepthPrePass draws the mesh first
+  // with a shader variant that exits right after the alpha test, then the
+  // colour pass shades only the surviving front-most texels. On the leaves
+  // (one thin-instanced mesh) that is ONE extra draw that removes leaf overdraw.
+  const prepass = q.get("prepass");
+  // ?prepassfix=0 reproduces the Babylon bug the fix works around.
+  if (prepass && q.get("prepassfix") !== "0") for (const m of world.materials) new DepthPrePassAlphaTestFix(m);
+  if (prepass === "leaves") world.leaves.material!.needDepthPrePass = true;
+  if (prepass === "all") for (const m of world.materials) m.needDepthPrePass = true;
 
   // ---- Sundial ----------------------------------------------------------------
   const sundial = new SundialBabylon(scene, sun, {
