@@ -658,11 +658,10 @@ const DEFINES: Record<string, boolean> = { PSENABLED: false };
 for (let k = 0; k < MAX_LIGHTS; k++) DEFINES[`PSLIGHT${k}`] = false;
 
 /**
- * Receiver injection. The shadow scales the sun's light colour at
- * CUSTOM_LIGHT{k}_COLOR, which covers diffuse plus PBR specular, sheen and
- * clear coat; StandardMaterial's separate specular colour is scaled by a
- * per-light regex. No samplers are added, so terrain's 16-sampler budget is
- * untouched.
+ * Receiver injection. Each light's Sundial factor is computed at
+ * CUSTOM_LIGHT{k}_COLOR and folded into Babylon's per-light shadow term with
+ * min(), which Babylon applies to diffuse plus specular, sheen and clear coat.
+ * No samplers are added, so terrain's 16-sampler budget is untouched.
  */
 class SundialPlugin extends MaterialPluginBase {
   /** The instance whose shadows this material samples; rebound when a new instance adds it. */
@@ -714,6 +713,8 @@ class SundialPlugin extends MaterialPluginBase {
     const code: Record<string, string> = {
       CUSTOM_FRAGMENT_DEFINITIONS: `
 var<private> psLightShadow: array<f32, ${MAX_LIGHTS}> = array<f32, ${MAX_LIGHTS}>(${Array(MAX_LIGHTS).fill("1.0").join(", ")});
+// The current light's Sundial factor, folded into Babylon's own shadow term below.
+var<private> psCur: f32 = 1.0;
 #ifdef PSENABLED
 ${COMMON_WGSL}
 var<storage, read> psParams: PsParams;
@@ -743,11 +744,21 @@ if (psLive${k}) { psLightShadow[${k}] = psShadow(fragmentInputs.vPositionW, norm
 #else
 psLightShadow[${k}] = psShadow(fragmentInputs.vPositionW, normalW);
 #endif
-diffuse${k} = vec4f(psApply(diffuse${k}.rgb, psLightShadow[${k}]), diffuse${k}.a);
+psCur = psLightShadow[${k}];
+// Debug mode only: tint the light by the sampled level (a no-op otherwise).
+diffuse${k} = vec4f(psApply(diffuse${k}.rgb, 1.0), diffuse${k}.a);
+#else
+psCur = 1.0;
 #endif
 `;
-      code[`!light${k}\\.vLightSpecular\\.rgb`] = `(light${k}.vLightSpecular.rgb*psLightShadow[${k}])`;
     }
+    // Every light ends its shadow step with this line, and Babylon then scales
+    // diffuse, specular, sheen and clear coat by `shadow`. Folding Sundial in
+    // here with min() means: with no Babylon shadow on the light (shadow = 1)
+    // Sundial alone decides; with one (World keeps a small CSM for skinned
+    // avatars) the darker of the two wins, so overlapping shadows never
+    // darken twice; and no plugin that replaces the light colour can undo it.
+    code["!aggShadow\\+=shadow;"] = "shadow=min(shadow,psCur);aggShadow+=shadow;";
     return code;
   }
 }

@@ -1,5 +1,8 @@
 import "@babylonjs/core";
-import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, Vector3, Color3 } from "@babylonjs/core";
+// Loaded up front: the shadow generator imports these lazily, which this harness's Vite cannot serve.
+import "@babylonjs/core/ShadersWGSL/shadowMap.fragment.js";
+import "@babylonjs/core/ShadersWGSL/shadowMap.vertex.js";
+import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, ShadowGenerator, Vector3, Color3 } from "@babylonjs/core";
 import { SundialBabylon, readCoverage } from "@poqpoq/sundial/babylon";
 const r = (window.__result = { imported: true });
 try {
@@ -86,6 +89,29 @@ try {
       sd.setDarkness(1); await frames(5);
       r.lumaDark1 = await meanLuma();
       sd.setDarkness(0);
+      // ?csm=1: the box ALSO casts through a Babylon ShadowGenerator on the same light, as World's
+      // avatars do under Sundial. Both at darkness 0.5: combined with min() the overlap is exactly as
+      // dark as either alone, so the frame matches Sundial alone; multiplied, it would be 0.25 there.
+      if (new URLSearchParams(location.search).get("csm") === "1") {
+        sd.setDarkness(0.5); await frames(5);
+        r.csm = { sundialOnly: await meanLuma() };
+        const sg = new ShadowGenerator(2048, sun);
+        sun.position = sun.direction.scale(-40);
+        sg.usePercentageCloserFiltering = true;
+        sg.setDarkness(0.5);
+        sg.addShadowCaster(box);
+        scene.shadowsEnabled = true;
+        await scene.whenReadyAsync(); await frames(20);
+        r.csm.both = await meanLuma();
+        // Proof the Babylon shadow is live: alone (Sundial off) it darkens the frame.
+        sd.setEnabled(false); await frames(10);
+        r.csm.babylonOnly = await meanLuma();
+        sg.setDarkness(1); await frames(5);
+        r.csm.noShadow = await meanLuma();
+        sd.setEnabled(true); await frames(10);
+        sg.dispose(); await frames(5);
+        sd.setDarkness(0);
+      }
       // A material created after start() receives without being registered.
       const late = new StandardMaterial("late", scene);
       const lateGround = MeshBuilder.CreateGround("lg", { width: 6, height: 6 }, scene); lateGround.position.set(0, 0.01, 8);

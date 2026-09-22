@@ -12,7 +12,7 @@ const server = await createServer({ root: import.meta.dirname, configFile: join(
 await server.listen();
 const b = await chromium.launch({ executablePath: exe, headless: false, args: ["--force_high_performance_gpu", "--enable-unsafe-webgpu"] });
 let failed = false;
-for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "webgpu&pbr=1"]) {
+for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "webgpu&pbr=1", "webgpu&csm=1"]) {
   const p = await b.newPage({ viewport: { width: 1200, height: 800 } });
   const errs = []; p.on("pageerror", (e) => errs.push(e.message)); p.on("console", (m) => { if (m.type() === "error" && !/404/.test(m.text())) errs.push(m.text().slice(0, 160)); });
   await p.goto(`http://localhost:5189/?engine=${engine}`);
@@ -35,7 +35,10 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       // a material made after start() picked up the receiver on its own
       res.late.plugin && res.late.enabled &&
       // after dispose, a second instance took over the same materials and is paging
-      res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1);
+      res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1 &&
+      // a second (Babylon) shadow on the same caster does not darken the overlap twice
+      (!res.csm || (res.csm.babylonOnly < res.csm.noShadow - 0.1 &&
+        Math.abs(res.csm.both - res.csm.sundialOnly) < 0.35 * (res.csm.noShadow - res.csm.sundialOnly))));
   failed ||= !ok;
   console.log(ok ? "PASS" : "FAIL", engine, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "");
   await p.close();
