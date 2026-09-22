@@ -43,16 +43,19 @@ export function workLayout(slots: number, pages: number, renderBudgetMax: number
   return { slotState, slotRender, physOwner, physLastUsed, lists, renderList, indirect, total: indirect + 12 };
 }
 
-/** Shared by the kernels and the raster stage: sceneData holds clusters then instances, 3 vec4f each. */
+/**
+ * Shared by the kernels and the raster stage: sceneData holds clusters then instances, 3 vec4f each.
+ * A cluster's indices are local to its geometry; vertexBase is where that geometry's vertices start.
+ */
 export const SCENE_WGSL = /* wgsl */ `
-struct PsCluster { aabbMin: vec3f, aabbMax: vec3f, firstIndex: u32, triCount: u32, alphaLayer: u32, alphaCutoff: f32 };
+struct PsCluster { aabbMin: vec3f, aabbMax: vec3f, firstIndex: u32, triCount: u32, alphaLayer: u32, alphaCutoff: f32, vertexBase: u32 };
 struct PsInstance { r0: vec4f, r1: vec4f, r2: vec4f };
 
 fn psCluster(i: u32) -> PsCluster {
   let a = sceneData[i * 3u];
   let b = sceneData[i * 3u + 1u];
   let c = sceneData[i * 3u + 2u];
-  return PsCluster(a.xyz, b.xyz, bitcast<u32>(a.w), bitcast<u32>(b.w), bitcast<u32>(c.x), c.y);
+  return PsCluster(a.xyz, b.xyz, bitcast<u32>(a.w), bitcast<u32>(b.w), bitcast<u32>(c.x), c.y, bitcast<u32>(c.z));
 }
 
 fn psInstance(i: u32) -> PsInstance {

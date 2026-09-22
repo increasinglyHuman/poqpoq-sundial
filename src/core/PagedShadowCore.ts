@@ -143,6 +143,9 @@ const STORAGE = 0x0080;
 const COPY_DST = 0x0008;
 const COPY_SRC = 0x0004;
 
+/** Builds an unused geometry stays cached for: content back within this many rebuilds is not re-clustered. */
+const CACHE_GRACE_BUILDS = 4;
+
 export class PagedShadowCore {
   readonly device: GPUDevice;
   readonly levelCount: number;
@@ -195,8 +198,14 @@ export class PagedShadowCore {
   private readonly levels: LevelState[] = [];
 
   private geometries: BuiltGeometry[] = [];
-  /** Clustered geometry by caller key, kept across rebuilds; pruned to what the last build used. */
-  private geometryCache = new Map<string, BuiltGeometry>();
+  /**
+   * Clustered geometry by caller key, kept across rebuilds. An entry the last
+   * builds did not use survives CACHE_GRACE_BUILDS more of them: content that
+   * drops out for one rebuild (hidden while it loads, culled, re-created) comes
+   * back without being clustered again, which is a first build's whole cost.
+   */
+  private geometryCache = new Map<string, { geometry: BuiltGeometry; lastBuild: number }>();
+  private buildCount = 0;
   /** Keys registered since the last clearContent(), and the geometry index each got. */
   private geometryKeys = new Map<string, number>();
   private cacheHits = 0;
@@ -349,11 +358,11 @@ export class PagedShadowCore {
     if (key !== undefined) {
       const known = this.geometryKeys.get(key);
       if (known !== undefined) return known;
-      let built = this.geometryCache.get(key);
+      let built = this.geometryCache.get(key)?.geometry;
       if (built) this.cacheHits++;
       else {
         built = buildGeometry(resolve(), this.clusterTris);
-        this.geometryCache.set(key, built);
+        this.geometryCache.set(key, { geometry: built, lastBuild: this.buildCount });
       }
       this.geometries.push(built);
       this.geometryKeyOrder.push(key);
@@ -490,34 +499,38 @@ export class PagedShadowCore {
     const keys = this.geometryKeyOrder.includes(null) ? null : this.geometryKeyOrder.join("\n");
     const reuse = keys !== null && this.packed?.keys === keys;
     this.destroyContentBuffers(reuse);
-    for (const key of this.geometryCache.keys()) if (!this.geometryKeys.has(key)) this.geometryCache.delete(key);
+    this.buildCount++;
+    for (const [key, entry] of this.geometryCache) {
+      if (this.geometryKeys.has(key)) entry.lastBuild = this.buildCount;
+      else if (this.buildCount - entry.lastBuild > CACHE_GRACE_BUILDS) this.geometryCache.delete(key);
+    }
 
     if (!reuse) {
-      let vertexBase = 0;
-      let indexBase = 0;
-      const vertexData: Float32Array[] = [];
-      const indexData: Uint32Array[] = [];
-      const geomClusterStart: number[] = [];
+      // Each geometry's vertices are interleaved and its indices are local, so
+      // packing is one copy per geometry straight into the mapped buffers; the
+      // cluster record carries the geometry's vertex base for the vertex stage.
+      let vertexFloats = 0;
+      let indexCount = 0;
       let clusterCount = 0;
-      for (const geo of this.geometries) clusterCount += geo.clusters.length;
+      for (const geo of this.geometries) {
+        vertexFloats += geo.vertices.length;
+        indexCount += geo.indices.length;
+        clusterCount += geo.clusters.length;
+      }
+      const d = this.device;
+      const vertexBuffer = d.createBuffer({ label: "ps.vertices", size: Math.max(16, vertexFloats * 4), usage: STORAGE, mappedAtCreation: true });
+      const indexBuffer = d.createBuffer({ label: "ps.indices", size: Math.max(16, indexCount * 4), usage: STORAGE, mappedAtCreation: true });
+      const vertexView = new Float32Array(vertexBuffer.getMappedRange(0, vertexFloats * 4));
+      const indexView = new Uint32Array(indexBuffer.getMappedRange(0, indexCount * 4));
+      const geomClusterStart: number[] = [];
       const clusterVec = new Float32Array(clusterCount * 12);
       const clusterU = new Uint32Array(clusterVec.buffer);
+      let vertexBase = 0;
+      let indexBase = 0;
       let c = 0;
-      for (let g = 0; g < this.geometries.length; g++) {
-        const geo = this.geometries[g];
-        const vcount = geo.positions.length / 3;
-        const v = new Float32Array(vcount * 5);
-        for (let i = 0; i < vcount; i++) {
-          v[i * 5] = geo.positions[i * 3];
-          v[i * 5 + 1] = geo.positions[i * 3 + 1];
-          v[i * 5 + 2] = geo.positions[i * 3 + 2];
-          v[i * 5 + 3] = geo.uvs[i * 2];
-          v[i * 5 + 4] = geo.uvs[i * 2 + 1];
-        }
-        vertexData.push(v);
-        const idx = new Uint32Array(geo.indices.length);
-        for (let i = 0; i < idx.length; i++) idx[i] = geo.indices[i] + vertexBase;
-        indexData.push(idx);
+      for (const geo of this.geometries) {
+        vertexView.set(geo.vertices, vertexBase * 5);
+        indexView.set(geo.indices, indexBase);
         geomClusterStart.push(c);
         for (const cl of geo.clusters) {
           const o = c * 12;
@@ -527,13 +540,14 @@ export class PagedShadowCore {
           clusterU[o + 7] = cl.triCount;
           clusterU[o + 8] = cl.alphaLayer;
           clusterVec[o + 9] = cl.alphaCutoff;
+          clusterU[o + 10] = vertexBase;
           c++;
         }
-        vertexBase += vcount;
-        indexBase += idx.length;
+        vertexBase += geo.vertexCount;
+        indexBase += geo.indices.length;
       }
-      const vertexBuffer = this.upload("ps.vertices", concatF32(vertexData), STORAGE);
-      const indexBuffer = this.upload("ps.indices", concatU32(indexData), STORAGE);
+      vertexBuffer.unmap();
+      indexBuffer.unmap();
       // Unkeyed geometry has no identity to compare next time: a key no rebuild can match.
       this.packed = { keys: keys ?? "\u0000unkeyed", vertexBuffer, indexBuffer, clusterVec, geomClusterStart, clusterCount };
     }
@@ -1080,24 +1094,4 @@ function affineRows(m: Float32Array | number[], o: number): number[] {
     m[o + 1], m[o + 5], m[o + 9], m[o + 13],
     m[o + 2], m[o + 6], m[o + 10], m[o + 14],
   ];
-}
-
-function concatF32(parts: Float32Array[]): Float32Array {
-  const out = new Float32Array(parts.reduce((s, p) => s + p.length, 0));
-  let o = 0;
-  for (const p of parts) {
-    out.set(p, o);
-    o += p.length;
-  }
-  return out;
-}
-
-function concatU32(parts: Uint32Array[]): Uint32Array {
-  const out = new Uint32Array(parts.reduce((s, p) => s + p.length, 0));
-  let o = 0;
-  for (const p of parts) {
-    out.set(p, o);
-    o += p.length;
-  }
-  return out;
 }
