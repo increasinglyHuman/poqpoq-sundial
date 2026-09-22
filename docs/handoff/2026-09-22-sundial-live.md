@@ -85,6 +85,8 @@ is done; step 4 (the field A/B) has started.
 
 ## Rules in force
 
+- **World CI takes about 7–12 minutes** per run (8–12 min on 2026-09-22). Budget for it before a
+  deploy: a pin change needs a green run on its PR before it merges.
 - **World deploys:** message every live World session (on 2026-09-22 that was world-ee, world-e7
   and world-25) and wait for acks; one builder at a time (Allen's rule).
   - Deploy with the wsl-poqpoq recipe: narrow rsync of `assets/`, `runtime/` and `index.html`,
@@ -116,12 +118,55 @@ is done; step 4 (the field A/B) has started.
    an Intel run look like today's, `?sundial=0` kept as the escape hatch.
    - Middle option: default ON for discrete GPUs only.
 
-## Babylon upstream (separate thread)
+## Babylon upstream PRs (separate thread, both open)
 
-- **`BabylonJS/Babylon.js#18934` (atmosphere plugin scope):** Popov requested changes. Fixed with
-  per-instance registration keys plus unit tests, and replied. Awaiting his re-review.
-- **`BabylonJS/Babylon.js#18936` (StandardMaterial depth pre-pass alpha):** open. Maintainer
-  `/azp run` needed for CI.
+Both came out of this lane's work. They're filed from Allen's fork, clone `C:/Users/incre/blackbox/Babylon.js`,
+with remote `upstream` = BabylonJS/Babylon.js. Read memory `babylon-upstream-pr-workflow` before
+touching either. **The visual-test harness runs the UMD bundle, not `dev/core/dist`:** after every
+source change run `node scripts/ensureUmdBuilds.mjs` and grep the bundle for your change, or the
+tests silently check stale code. Babylon's CI starts only when a maintainer comments `/azp run`.
+
+### #18934: Atmosphere plugin scope (branch `fix/atmosphere-plugin-scene-scope`)
+- **The bug.** `Atmosphere` registered its PBR material plugin globally, so PBR materials in OTHER
+  scenes or engines got an atmosphere plugin bound to the wrong context.
+- **Commits.**
+  - `6dba46b`: the factory only attaches in the atmosphere's own scene.
+  - `4b1676c`: after Popov's review, per-instance registration keys (`atmo-pbr-${uniqueId}`); no
+    unconditional unregister; `dispose()` removes only its own key. Adds
+    `addons/test/unit/atmosphere/materialPluginRegistration.test.ts` (NullEngine, 4 cases, all fail
+    on master).
+- **Status (2026-09-22 14:21Z):** Popov **APPROVED**. deltakosh **CHANGES_REQUESTED** (10:17Z), so it's
+  still blocked:
+  > With two Atmospheres in the SAME scene, both factories run for each new PBR material. The second
+  > `AtmospherePBRMaterialPlugin` activates itself before `_addPlugin` rejects the duplicate name, so
+  > it stays in `_activePlugins`, its shader injections concatenate with the first's, and the material
+  > can fail to compile.
+- **To do:**
+  - Don't construct a second plugin when the material already has one. In the factory, check
+    `material.pluginManager?.getPlugin("AtmospherePBRMaterialPlugin")` and return null. Or enforce
+    one Atmosphere per scene.
+  - Add a same-scene regression test that checks the ACTIVE plugins or the shader, not just
+    `getPlugin()`.
+
+### #18936: StandardMaterial depth pre-pass honours alpha test (branch `fix/standard-depthprepass-alphatest`)
+- **The bug.** A StandardMaterial with `needDepthPrePass` and an alpha test wrote depth for discarded
+  texels, punching holes in later geometry. Separately, `alphaCutOff` wasn't bound for alpha sources
+  other than textures.
+- **Commits.**
+  - `b39f460`: a shared GLSL/WGSL alpha include, evaluated before the pre-pass exits.
+  - `0800c3b`: bind `alphaCutOff` whenever `ALPHATEST` is defined.
+  - `819ac00`: the visualization test `needDepthPrePassStandardAlphaTest` (Playground `#7EDYVC#3`),
+    which fails on master and passes on WebGL2 and WebGPU.
+  - The full suite was compared against master: no regressions.
+- **Status (15:41Z):** deltakosh **APPROVED**. Popov: "approve with minor changes" (14:21Z), with two
+  inline asks on `packages/tools/tests/test/visualization/config.json`:
+  1. Cover the newly supported alpha paths as well: **material-only alpha**,
+     **`INSTANCESCOLOR && INSTANCES`** and **`OPACITYFRESNEL`**. Today's scene covers only diffuse
+     alpha, opacity-texture alpha and vertex alpha.
+  2. Add **`Textures`** and **`Meshes`** to the test's `dependsOn`, so selective CI runs it.
+- **To do:** extend the Playground scene with those three cases, save a new snippet revision,
+  regenerate and LOOK at the reference image (after `ensureUmdBuilds`), update `config.json`, and
+  reply inline.
 
 ## Local layout
 
