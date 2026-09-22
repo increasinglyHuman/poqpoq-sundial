@@ -205,16 +205,31 @@ interface DynamicCaster {
  * the renderer resolves it, so a mesh with no material still casts (it draws
  * with the scene's default material).
  */
-function castingRuns(mesh: Mesh, indices: ArrayLike<number>): Map<Material | null, number[]> {
-  const runs = new Map<Material | null, number[]>();
+function castingRuns(mesh: Mesh, indices: ArrayLike<number>): Map<Material | null, Uint32Array> {
   const root = mesh.material;
   const multi = root && (root as unknown as MultiMaterial).getSubMaterial ? (root as unknown as MultiMaterial) : null;
+  // Size each material's run first, then fill typed arrays: a rebuild walks
+  // every index of every caster, and pushing into JS arrays (then copying them
+  // to typed arrays to hash) was most of a rebuild's time.
+  const subMeshes: [Material | null, SubMesh][] = [];
+  const sizes = new Map<Material | null, number>();
   for (const sm of mesh.subMeshes ?? []) {
     const material = multi ? multi.getSubMaterial(sm.materialIndex) : root;
     if (multi && !material) continue;
-    let run = runs.get(material);
-    if (!run) runs.set(material, (run = []));
-    for (let i = sm.indexStart, end = sm.indexStart + sm.indexCount; i < end; i++) run.push(indices[i]);
+    subMeshes.push([material, sm]);
+    sizes.set(material, (sizes.get(material) ?? 0) + sm.indexCount);
+  }
+  const runs = new Map<Material | null, Uint32Array>();
+  const fill = new Map<Material | null, number>();
+  for (const [material, size] of sizes) {
+    runs.set(material, new Uint32Array(size));
+    fill.set(material, 0);
+  }
+  for (const [material, sm] of subMeshes) {
+    const run = runs.get(material)!;
+    let w = fill.get(material)!;
+    for (let i = sm.indexStart, end = sm.indexStart + sm.indexCount; i < end; i++) run[w++] = indices[i];
+    fill.set(material, w);
   }
   return runs;
 }
@@ -238,7 +253,7 @@ function contentHash(...parts: ArrayLike<number>[]): string {
 }
 
 /** Keep only the vertices a run uses, so a mesh split by material does not upload its vertices once per material. */
-function compact(run: number[], positions: ArrayLike<number>, uvs?: ArrayLike<number> | null) {
+function compact(run: ArrayLike<number>, positions: ArrayLike<number>, uvs?: ArrayLike<number> | null) {
   const remap = new Map<number, number>();
   const indices = new Uint32Array(run.length);
   for (let i = 0; i < run.length; i++) {
@@ -447,7 +462,8 @@ export class SundialBabylon {
       }
       if (!alpha) uvs = null;
       const key = `${scope}:${contentHash(run)}:${alpha ? `${alpha.layer}/${alpha.cutoff}:${contentHash(uvs!)}` : "opaque"}`;
-      const geometry = this.core.addGeometry({ ...compact(run, positions, uvs), alpha }, key);
+      // Compacted only on a cache miss: on a rebuild of unchanged content it is never needed.
+      const geometry = this.core.addGeometry(() => ({ ...compact(run, positions, uvs), alpha }), key);
       groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
     }
     if (opts.dynamic && groups.length) this.dynamics.push({ mesh, groups, last: matrices.slice() });

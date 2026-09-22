@@ -36,6 +36,10 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.late.plugin && res.late.enabled &&
       // a member hidden in the live buffer casts from instanceMatrices: its shadow darkens the frame
       res.instanceCanon < res.instanceLive - 0.1 &&
+      // rebuilds re-render only what changed, and the picture stays right
+      res.rebuildSame.reusedGeometry === true && res.rebuildSame.invalidated === 0 && res.rebuildSame.luma === res.lumaBase &&
+      res.rebuildAdd.invalidated === 1 && res.rebuildAdd.luma < res.lumaBase - 0.05 &&
+      res.rebuildRemove.invalidated === 1 && Math.abs(res.rebuildRemove.luma - res.lumaBase) < 0.02 &&
       // requests are per frame: empty sky requests fewer pages than the ground, and they come back
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
       // after dispose, a second instance took over the same materials and is paging
