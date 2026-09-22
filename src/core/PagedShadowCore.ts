@@ -15,7 +15,7 @@ import {
   type WorkLayout,
 } from "./kernels";
 import { rasterWGSL } from "./raster";
-import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, PARAMS_BYTES, PARAMS_HEADER_BYTES } from "./wgsl";
+import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, PARAMS_BYTES, PARAMS_HEADER_BYTES, SHADE_WORD } from "./wgsl";
 
 // Sundial: a paged, cached shadow clipmap for one directional light.
 //
@@ -49,6 +49,12 @@ export interface PagedShadowOptions {
   clusterTris?: number;
   alphaTextureSize?: number;
   maxAlphaLayers?: number;
+  /**
+   * Clip triangles to their page with the `clip-distances` feature (default:
+   * when the device has it). false forces the fragment-discard fallback, which
+   * is what runs on a device created without that feature.
+   */
+  clipDistances?: boolean;
 }
 
 export interface FrameInput {
@@ -77,6 +83,12 @@ export interface Tuning {
   /** Sun-angle tolerance of level 0 in degrees; level k tolerates 2^k times more. */
   bandDegrees: number;
   renderBudget: number;
+  /**
+   * Light left in full shadow: 0 = black, 1 = no visible shadow. Same meaning
+   * as Babylon's ShadowGenerator.setDarkness, so a host can feed it the value
+   * it already computes (fill, dusk fade).
+   */
+  darkness: number;
 }
 
 export interface Stats {
@@ -151,6 +163,7 @@ export class PagedShadowCore {
     debugMode: 0,
     bandDegrees: 0.05,
     renderBudget: 96,
+    darkness: 0,
   };
 
   /** Resources receivers bind (params, page table, pool). */
@@ -165,8 +178,8 @@ export class PagedShadowCore {
     levelRefreshes: 0, lastRefreshedLevel: -1,
   };
 
-  private readonly sceneMin: Vec3;
-  private readonly sceneMax: Vec3;
+  private sceneMin: Vec3;
+  private sceneMax: Vec3;
   private readonly renderBudgetMax: number;
   private readonly slots: number;
   private readonly work: WorkLayout;
@@ -174,12 +187,19 @@ export class PagedShadowCore {
   private readonly counterBuffer: GPUBuffer;
   private readonly pairBuffer: GPUBuffer;
   private readonly alphaTexture: GPUTexture;
-  private readonly alphaSize: number;
+  /** Texels per side of each alpha layer. */
+  readonly alphaSize: number;
+  readonly alphaLayerCount: number;
   private readonly alphaSampler: GPUSampler;
   private readonly params = new ArrayBuffer(PARAMS_BYTES);
   private readonly levels: LevelState[] = [];
 
   private geometries: BuiltGeometry[] = [];
+  /** Clustered geometry by caller key, kept across rebuilds; pruned to what the last build used. */
+  private geometryCache = new Map<string, BuiltGeometry>();
+  /** Keys registered since the last clearContent(), and the geometry index each got. */
+  private geometryKeys = new Map<string, number>();
+  private cacheHits = 0;
   private groups: InstanceGroup[] = [];
   private instanceMatrices: number[] = []; // 12 floats (3 affine rows) per instance
   private instanceGeometry: number[] = [];
@@ -229,11 +249,12 @@ export class PagedShadowCore {
     this.tuning.renderBudget = options.renderBudget ?? this.tuning.renderBudget;
     this.slots = this.levelCount * this.pagesPerSide * this.pagesPerSide;
     this.work = workLayout(this.slots, this.pageCount, this.renderBudgetMax);
-    this.useClipDistances = device.features.has("clip-distances");
+    this.useClipDistances = device.features.has("clip-distances") && options.clipDistances !== false;
     this.hasTimestamps = device.features.has("timestamp-query");
 
-    this.paramsBuffer = device.createBuffer({ label: "ps.params", size: PARAMS_BYTES, usage: STORAGE | COPY_DST });
-    this.pageTableBuffer = device.createBuffer({ label: "ps.pageTable", size: this.slots * 8, usage: STORAGE | COPY_DST });
+    // COPY_SRC on the two buffers receivers read, so a host can inspect them (diagnostics).
+    this.paramsBuffer = device.createBuffer({ label: "ps.params", size: PARAMS_BYTES, usage: STORAGE | COPY_DST | COPY_SRC });
+    this.pageTableBuffer = device.createBuffer({ label: "ps.pageTable", size: this.slots * 8, usage: STORAGE | COPY_DST | COPY_SRC });
     this.requestBuffer = device.createBuffer({ label: "ps.requests", size: this.slots * 4, usage: STORAGE | COPY_DST });
     this.counterBuffer = device.createBuffer({ label: "ps.counters", size: COUNTER_COUNT * 4, usage: STORAGE | COPY_DST | COPY_SRC });
     this.workBuffer = device.createBuffer({
@@ -246,10 +267,10 @@ export class PagedShadowCore {
       label: "ps.pool",
       size: [this.poolSize, this.poolSize],
       format: "depth32float",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
     this.alphaSize = options.alphaTextureSize ?? 256;
-    const alphaLayers = options.maxAlphaLayers ?? 4;
+    const alphaLayers = (this.alphaLayerCount = options.maxAlphaLayers ?? 4);
     this.alphaTexture = device.createTexture({
       label: "ps.alpha",
       size: [this.alphaSize, this.alphaSize, alphaLayers],
@@ -291,9 +312,42 @@ export class PagedShadowCore {
 
   // ---- content ------------------------------------------------------------
 
-  addGeometry(input: GeometryInput): number {
+  /**
+   * Register a geometry. With a `key`, geometry registered again under the
+   * same key reuses its clusters: within one build it is the same geometry
+   * (instances share it), and across rebuilds the clustering is not redone.
+   * The key must change whenever the input does.
+   */
+  addGeometry(input: GeometryInput, key?: string): number {
+    if (key !== undefined) {
+      const known = this.geometryKeys.get(key);
+      if (known !== undefined) return known;
+      let built = this.geometryCache.get(key);
+      if (built) this.cacheHits++;
+      else {
+        built = buildGeometry(input, this.clusterTris);
+        this.geometryCache.set(key, built);
+      }
+      this.geometries.push(built);
+      this.geometryKeys.set(key, this.geometries.length - 1);
+      return this.geometries.length - 1;
+    }
     this.geometries.push(buildGeometry(input, this.clusterTris));
     return this.geometries.length - 1;
+  }
+
+  /**
+   * Forget every registered geometry and instance, ready to register the
+   * content again and build(). Clustered geometry stays cached by key.
+   */
+  clearContent(): void {
+    this.geometries = [];
+    this.geometryKeys.clear();
+    this.cacheHits = 0;
+    this.groups = [];
+    this.instanceMatrices = [];
+    this.instanceGeometry = [];
+    this.dirtyInstances.clear();
   }
 
   /** `matrices` holds 16 floats per instance, column-major with translation at 12..14 (Babylon and three.js layout). */
@@ -312,7 +366,8 @@ export class PagedShadowCore {
   setInstanceMatrix(group: InstanceGroup, index: number, matrix: Float32Array | number[]): void {
     const inst = group.first + index;
     const before = this.instanceBounds(inst);
-    this.instanceMatrices.splice(inst * 12, 12, ...affineRows(matrix, 0));
+    const rows = affineRows(matrix, 0);
+    for (let k = 0; k < 12; k++) this.instanceMatrices[inst * 12 + k] = rows[k];
     const after = this.instanceBounds(inst);
     this.invalidateBox(
       [Math.min(before[0][0], after[0][0]), Math.min(before[0][1], after[0][1]), Math.min(before[0][2], after[0][2])],
@@ -332,6 +387,16 @@ export class PagedShadowCore {
 
   invalidateAll(): void {
     for (const lv of this.levels) lv.invalidate = true;
+  }
+
+  /**
+   * Change the world bounds of everything that casts or receives (a region
+   * or sim change). Every level is re-fitted and re-rendered.
+   */
+  setSceneBounds(min: Vec3, max: Vec3): void {
+    this.sceneMin = [...min];
+    this.sceneMax = [...max];
+    this.invalidateAll();
   }
 
   /**
@@ -380,8 +445,15 @@ export class PagedShadowCore {
     }
   }
 
-  /** Pack all registered content into GPU buffers. Call once after adding content. */
+  /**
+   * Pack all registered content into GPU buffers. Call after adding content;
+   * call again after clearContent() and re-registering to replace it. A
+   * rebuild frees the previous buffers and re-renders every cached page.
+   */
   build(): void {
+    this.destroyContentBuffers();
+    for (const key of this.geometryCache.keys()) if (!this.geometryKeys.has(key)) this.geometryCache.delete(key);
+    if (this.started) this.invalidateAll();
     const clusterRecords: { geom: number; base: number }[] = [];
     let vertexBase = 0;
     let indexBase = 0;
@@ -463,9 +535,32 @@ export class PagedShadowCore {
     });
   }
 
+  /** Free every GPU resource. The core cannot be used afterwards. */
+  dispose(): void {
+    this.destroyContentBuffers();
+    for (const b of [this.paramsBuffer, this.pageTableBuffer, this.requestBuffer, this.counterBuffer, this.workBuffer, this.pairBuffer]) b.destroy();
+    for (const rb of this.readbacks) rb.buffer.destroy();
+    this.queryResolve?.destroy();
+    this.querySet?.destroy();
+    this.poolTexture.destroy();
+    this.alphaTexture.destroy();
+    this.geometryCache.clear();
+    this.depthBinding = null;
+  }
+
+  private destroyContentBuffers(): void {
+    for (const b of [this.sceneBuffer, this.clusterInstanceBuffer, this.vertexBuffer, this.indexBuffer]) b?.destroy();
+    this.sceneBuffer = this.clusterInstanceBuffer = this.vertexBuffer = this.indexBuffer = null;
+    this.computeGroup = this.rasterGroup = null;
+  }
+
   get contentSummary() {
     return {
+      /** Geometries registered since clearContent() that reused cached clusters. */
+      cachedGeometries: this.cacheHits,
       geometries: this.geometries.length,
+      /** Clusters that cast through an alpha mask. */
+      alphaClusters: this.geometries.reduce((s, g) => s + g.clusters.filter((c) => c.alphaLayer !== 0xffffffff).length, 0),
       instances: this.instanceGeometry.length,
       clusters: this.clusterCount,
       clusterInstances: this.clusterInstanceCount,
@@ -488,7 +583,10 @@ export class PagedShadowCore {
 
     const enc = d.createCommandEncoder({ label: "ps.frame" });
     enc.clearBuffer(this.counterBuffer);
-    enc.clearBuffer(this.requestBuffer);
+    // Legacy path: mark from last frame's depth at the start of this frame.
+    // With markInto(), requests were written during the previous frame and
+    // are consumed here, then cleared after paging.
+    if (depth) enc.clearBuffer(this.requestBuffer);
 
     const wg = (n: number) => Math.max(1, Math.ceil(n / 64));
     const k = this.kernels;
@@ -526,6 +624,7 @@ export class PagedShadowCore {
     cp.setPipeline(k.finalizeDraws);
     cp.dispatchWorkgroups(1);
     cp.end();
+    if (!depth) enc.clearBuffer(this.requestBuffer);
 
     const rp = enc.beginRenderPass({
       label: "ps.raster",
@@ -559,6 +658,36 @@ export class PagedShadowCore {
     }
     d.queue.submit([enc.finish()]);
     if (rb) this.readStats(rb, this.frame);
+  }
+
+  /**
+   * Mark pages from a camera depth buffer inside the HOST's command encoder,
+   * right after the camera that produced it has rendered and before anything
+   * else (a HUD camera, a post-process) can clear or overwrite that depth.
+   * The requests are consumed by the next update(). Use this instead of
+   * FrameInput.depth whenever the host lets you encode mid-frame.
+   */
+  markInto(encoder: GPUCommandEncoder, depth: { texture: GPUTexture; invViewProj: ArrayLike<number> }): void {
+    if (!this.computeGroup) return;
+    const bound = this.bindDepth(depth.texture);
+    const block = new Float32Array(20);
+    block.set(Array.from(depth.invViewProj).slice(0, 16), 0);
+    block.set([depth.texture.width, depth.texture.height, this.markStride, 1], 16);
+    this.device.queue.writeBuffer(this.paramsBuffer, 20 * 4, block);
+    const mp = encoder.beginComputePass({
+      label: "ps.mark",
+      timestampWrites: this.querySet
+        ? { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
+        : undefined,
+    });
+    mp.setBindGroup(0, this.computeGroup);
+    mp.setPipeline(bound.pipeline);
+    mp.setBindGroup(1, bound.group);
+    mp.dispatchWorkgroups(
+      Math.ceil(depth.texture.width / this.markStride / 8),
+      Math.ceil(depth.texture.height / this.markStride / 8),
+    );
+    mp.end();
   }
 
   // ---- internals --------------------------------------------------------------
@@ -627,6 +756,7 @@ export class PagedShadowCore {
     } else {
       f.set([0, 0, this.markStride, 0], 36);
     }
+    f.set([Math.min(1, Math.max(0, t.darkness)), 0, 0, 0], SHADE_WORD);
 
     const corners: Vec3[] = [];
     for (let k = 0; k < 8; k++) {
