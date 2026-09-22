@@ -187,6 +187,17 @@ try {
       sd2.setDarkness(1); await frames(5);
       r.second.luma1 = await meanLuma();
       sd2.setDarkness(0);
+      // Two shapes that differ only by fractions of a unit are two geometries. MeshBuilder keeps its
+      // positions as number[], and hashing those through Uint32Array truncated every coordinate, so a
+      // 1 m box and a 0.6 m box (all coordinates within ±0.5) shared one key and one shadow.
+      {
+        const small = MeshBuilder.CreateBox("small", { size: 0.6 }, scene); small.position.set(-6, 0.3, -6);
+        const unit = MeshBuilder.CreateBox("unit", { size: 1 }, scene); unit.position.set(-8, 0.5, -6);
+        const before = sd2.core.contentSummary.geometries;
+        sd2.setCasters([ground, box, small, unit]);
+        await frames(5);
+        r.distinct = { numberArrays: Array.isArray(small.getVerticesData("position")), added: sd2.core.contentSummary.geometries - before };
+      }
       r.core = () => sd2.core.stats;
       r.done = true;
     })().catch((e) => { r.error = String(e); r.done = true; });

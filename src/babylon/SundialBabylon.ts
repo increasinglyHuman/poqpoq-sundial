@@ -239,10 +239,16 @@ function contentHash(...parts: ArrayLike<number>[]): string {
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193 ^ 0x5bd1e995;
   for (const part of parts) {
+    // Raw bits of 32-bit arrays; other integer arrays widen exactly. Plain number[] (MeshBuilder
+    // keeps positions that way) and Float64Array must go through float32: Uint32Array.from()
+    // truncates every coordinate to an integer, and shapes that differed only by fractions of a
+    // unit then shared one key (and one shadow) once keys became content-addressed.
     const words =
       part instanceof Float32Array || part instanceof Uint32Array || part instanceof Int32Array
         ? new Uint32Array(part.buffer, part.byteOffset, part.length)
-        : Uint32Array.from(part as ArrayLike<number>);
+        : ArrayBuffer.isView(part) && !(part instanceof Float64Array)
+          ? Uint32Array.from(part as ArrayLike<number>)
+          : new Uint32Array(Float32Array.from(part as ArrayLike<number>).buffer);
     for (let i = 0; i < words.length; i++) {
       h1 = Math.imul(h1 ^ words[i], 0x01000193);
       h2 = Math.imul(h2 ^ words[i], 0x5bd1e995) ^ (h2 >>> 15);
