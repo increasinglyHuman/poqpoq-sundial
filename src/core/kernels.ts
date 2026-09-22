@@ -216,9 +216,24 @@ fn allocate(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // K5: every requested page that is mapped but stale gets rendered, up to budget.
+// Two dispatches, coarsest level first: it is the fallback every finer page
+// relies on, and with no valid page at all a receiver is fully lit. Filled in
+// one atomic order, the coarsest slots (the highest indices) came last and were
+// the first to be deferred when the budget overflowed.
 @compute @workgroup_size(64)
-fn buildRenderList(@builtin(global_invocation_id) gid: vec3u) {
-  let idx = gid.x;
+fn buildRenderListCoarse(@builtin(global_invocation_id) gid: vec3u) {
+  let perLevel = psParams.grid.y * psParams.grid.y;
+  if (gid.x >= perLevel) { return; }
+  listPage((psParams.grid.x - 1u) * perLevel + gid.x);
+}
+
+@compute @workgroup_size(64)
+fn buildRenderListFine(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= (psParams.grid.x - 1u) * psParams.grid.y * psParams.grid.y) { return; }
+  listPage(gid.x);
+}
+
+fn listPage(idx: u32) {
   if (idx >= slotCount() || work[W_SLOT_STATE + idx] == 0u) { return; }
   let e = psPageTable[idx];
   if ((e.x & PS_MAPPED) == 0u || (e.x & PS_VALID) != 0u) { return; }

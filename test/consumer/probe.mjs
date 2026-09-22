@@ -48,6 +48,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
       // after dispose, a second instance took over the same materials and is paging
       res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1 &&
+      // fully faded shadows stop all GPU work, and come back unchanged on waking
+      res.second.dormant && res.second.woke && Math.abs(res.second.lumaAwake - res.second.luma0) < 0.02 &&
       // a second (Babylon) shadow on the same caster does not darken the overlap twice
       (!res.csm || (res.csm.babylonOnly < res.csm.noShadow - 0.1 &&
         Math.abs(res.csm.both - res.csm.sundialOnly) < 0.35 * (res.csm.noShadow - res.csm.sundialOnly))));

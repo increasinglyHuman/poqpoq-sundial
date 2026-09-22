@@ -113,6 +113,17 @@ fn psFetch(level: u32, centerPage: vec2i, centerPhys: u32, t: vec2i) -> f32 {
 
 // Light factor for a receiver: 1 fully lit, the darkness in full shadow.
 fn psShadow(posW: vec3f, normalW: vec3f) -> f32 {
+  // Fully faded (INVISIBLE_DARKNESS): the result would be 1 whatever the lookup says. Uniform branch.
+  if (psParams.shade.x >= 0.999) { return 1.0; }
+  return mix(psParams.shade.x, 1.0, psVisibility(posW, normalW));
+}
+
+// psShadow for surfaces that only take light on their front: one facing away
+// from the sun gets no direct light, so it is in full shadow without a lookup.
+// Not for two-sided or translucent materials, whose back is lit through.
+fn psShadowFront(posW: vec3f, normalW: vec3f) -> f32 {
+  if (psParams.shade.x >= 0.999) { return 1.0; }
+  if (dot(normalW, psParams.levels[0].dir.xyz) > 0.0) { return psParams.shade.x; }
   return mix(psParams.shade.x, 1.0, psVisibility(posW, normalW));
 }
 

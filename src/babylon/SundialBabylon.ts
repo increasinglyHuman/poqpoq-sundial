@@ -785,7 +785,12 @@ let psLive${k} = baseColor.a >= uniforms.alphaCutOff;
 #endif
 if (psLive${k}) { psLightShadow[${k}] = psShadow(fragmentInputs.vPositionW, normalW); }
 #else
+#if defined(TWOSIDEDLIGHTING) || defined(SS_TRANSLUCENCY)
 psLightShadow[${k}] = psShadow(fragmentInputs.vPositionW, normalW);
+#else
+// Opaque, one-sided: a face turned away from the sun is in full shadow, no lookup.
+psLightShadow[${k}] = psShadowFront(fragmentInputs.vPositionW, normalW);
+#endif
 #endif
 psCur = psLightShadow[${k}];
 // Debug mode only: tint the light by the sampled level (a no-op otherwise).
