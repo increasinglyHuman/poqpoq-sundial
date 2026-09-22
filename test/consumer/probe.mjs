@@ -36,6 +36,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.late.plugin && res.late.enabled &&
       // a receiver clones without throwing, the clone receives, and serialization leaves the plugin out
       res.clone.ok && res.clone.plugin && res.clone.enabled && res.clone.serialized &&
+      // boxes that differ only by fractions of a unit are two geometries, not one
+      res.distinct.added === 2 &&
       // a member hidden in the live buffer casts from instanceMatrices: its shadow darkens the frame
       res.instanceCanon < res.instanceLive - 0.1 &&
       // rebuilds re-render only what changed, and the picture stays right
