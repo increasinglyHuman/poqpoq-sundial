@@ -5,7 +5,7 @@
 export interface ClusterRecord {
   aabbMin: [number, number, number];
   aabbMax: [number, number, number];
-  firstIndex: number; // into the global index buffer
+  firstIndex: number; // relative to its geometry's indices; build() adds the geometry's index base
   triCount: number;
   alphaLayer: number; // 0xFFFFFFFF = opaque
   alphaCutoff: number;
@@ -19,8 +19,12 @@ export interface GeometryInput {
 }
 
 export interface BuiltGeometry {
-  positions: Float32Array;
-  uvs: Float32Array;
+  /**
+   * Position xyz + uv per vertex (5 floats), exactly as the vertex buffer holds
+   * it. Interleaved once here, so a repack copies it instead of rebuilding it.
+   */
+  vertices: Float32Array;
+  vertexCount: number;
   indices: Uint32Array; // local vertex indices, clusters contiguous
   clusters: ClusterRecord[]; // firstIndex relative to this geometry
   aabbMin: [number, number, number];
@@ -102,9 +106,20 @@ export function buildGeometry(input: GeometryInput, clusterTris: number): BuiltG
     });
   }
 
+  const uvs = input.uvs;
+  const vertices = new Float32Array(vertexCount * 5);
+  for (let i = 0; i < vertexCount; i++) {
+    vertices[i * 5] = pos[i * 3];
+    vertices[i * 5 + 1] = pos[i * 3 + 1];
+    vertices[i * 5 + 2] = pos[i * 3 + 2];
+    if (uvs) {
+      vertices[i * 5 + 3] = uvs[i * 2];
+      vertices[i * 5 + 4] = uvs[i * 2 + 1];
+    }
+  }
   return {
-    positions: pos,
-    uvs: input.uvs ?? new Float32Array(vertexCount * 2),
+    vertices,
+    vertexCount,
     indices,
     clusters,
     aabbMin: min,

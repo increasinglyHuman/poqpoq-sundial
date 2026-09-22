@@ -439,7 +439,10 @@ export class SundialBabylon {
     const indices = mesh.getIndices();
     if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
     const explicit = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
-    const scope = `${mesh.geometry?.uniqueId ?? `mesh${mesh.uniqueId}`}:${contentHash(positions)}`;
+    // Content-addressed, not by Babylon's geometry id: a prim that is deleted and
+    // re-created with the same shape (World does this on load and on edits) keeps
+    // its clusters, and identical shapes on different meshes share one geometry.
+    const scope = `${positions.length}:${contentHash(positions)}`;
     let matrices = casterMatrices(mesh, undefined, opts.dynamic ? undefined : opts.instanceMatrices);
     if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
       // Reserved slots start as zero matrices, which cast nothing.

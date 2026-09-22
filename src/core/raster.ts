@@ -93,7 +93,7 @@ fn caster(vi: u32, pairIndex: u32) -> CasterOut {
     ${clipCull}
     return out;
   }
-  let vtx = indices[cl.firstIndex + vi];
+  let vtx = indices[cl.firstIndex + vi] + cl.vertexBase;
   let lp = vec3f(vertices[vtx * 5u], vertices[vtx * 5u + 1u], vertices[vtx * 5u + 2u]);
   let m = psInstance(ci.y);
   let wp = vec3f(dot(m.r0.xyz, lp) + m.r0.w, dot(m.r1.xyz, lp) + m.r1.w, dot(m.r2.xyz, lp) + m.r2.w);
