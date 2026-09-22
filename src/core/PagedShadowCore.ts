@@ -252,8 +252,9 @@ export class PagedShadowCore {
     this.useClipDistances = device.features.has("clip-distances") && options.clipDistances !== false;
     this.hasTimestamps = device.features.has("timestamp-query");
 
-    this.paramsBuffer = device.createBuffer({ label: "ps.params", size: PARAMS_BYTES, usage: STORAGE | COPY_DST });
-    this.pageTableBuffer = device.createBuffer({ label: "ps.pageTable", size: this.slots * 8, usage: STORAGE | COPY_DST });
+    // COPY_SRC on the two buffers receivers read, so a host can inspect them (diagnostics).
+    this.paramsBuffer = device.createBuffer({ label: "ps.params", size: PARAMS_BYTES, usage: STORAGE | COPY_DST | COPY_SRC });
+    this.pageTableBuffer = device.createBuffer({ label: "ps.pageTable", size: this.slots * 8, usage: STORAGE | COPY_DST | COPY_SRC });
     this.requestBuffer = device.createBuffer({ label: "ps.requests", size: this.slots * 4, usage: STORAGE | COPY_DST });
     this.counterBuffer = device.createBuffer({ label: "ps.counters", size: COUNTER_COUNT * 4, usage: STORAGE | COPY_DST | COPY_SRC });
     this.workBuffer = device.createBuffer({
@@ -266,7 +267,7 @@ export class PagedShadowCore {
       label: "ps.pool",
       size: [this.poolSize, this.poolSize],
       format: "depth32float",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
     this.alphaSize = options.alphaTextureSize ?? 256;
     const alphaLayers = (this.alphaLayerCount = options.maxAlphaLayers ?? 4);

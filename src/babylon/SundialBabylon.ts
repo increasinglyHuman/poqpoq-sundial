@@ -11,6 +11,7 @@ import type { SubMesh } from "@babylonjs/core/Meshes/subMesh";
 import type { UniformBuffer } from "@babylonjs/core/Materials/uniformBuffer";
 import type { AbstractEngine } from "@babylonjs/core/Engines/abstractEngine";
 import type { Observer } from "@babylonjs/core/Misc/observable";
+import type { RenderTargetWrapper } from "@babylonjs/core/Engines/renderTargetWrapper";
 import { MaterialPluginBase } from "@babylonjs/core/Materials/materialPluginBase";
 import { ShaderLanguage } from "@babylonjs/core/Materials/shaderLanguage";
 import { BaseTexture } from "@babylonjs/core/Materials/Textures/baseTexture";
@@ -267,6 +268,26 @@ interface DepthSnapshot {
  * objects once and caches them, so edits made through the buffer plus
  * `thinInstanceBufferUpdated()` never show up there.
  */
+/**
+ * The depth buffer a camera's geometry actually lands in. A camera with an
+ * output render target, or with post-processes (World's world camera renders
+ * through image processing into an HDR target), never writes Babylon's main
+ * depth buffer: marking from that would see an empty buffer and request pages
+ * for the far plane only. Null when that depth cannot be sampled, so the caller
+ * can fall back to the main buffer.
+ */
+function cameraDepth(camera: Camera, scene: Scene): GPUTexture | null {
+  const cam = camera as Camera & { _getFirstPostProcess?: () => { inputTexture?: RenderTargetWrapper } | null };
+  const target =
+    camera.outputRenderTarget?.renderTarget ??
+    (scene.postProcessesEnabled ? cam._getFirstPostProcess?.()?.inputTexture : undefined) ??
+    null;
+  if (!target) return null;
+  const texture = (target._depthStencilTexture?._hardwareTexture as { underlyingResource?: GPUTexture } | null | undefined)
+    ?.underlyingResource;
+  return texture && texture.usage & GPUTextureUsage.TEXTURE_BINDING ? texture : null;
+}
+
 function casterMatrices(mesh: Mesh, out?: Float32Array): Float32Array {
   const world = mesh.computeWorldMatrix(true);
   const count = mesh.thinInstanceCount;
@@ -545,7 +566,7 @@ export class SundialBabylon {
       _renderEncoder?: GPUCommandEncoder;
       _endCurrentRenderPass?: () => void;
     };
-    const depth = engine._depthTexture;
+    const depth = this.depthOf(camera);
     if (!depth) return;
     camera.getTransformationMatrix().invertToRef(this.scratch);
     if (engine._renderEncoder && engine._endCurrentRenderPass) {
@@ -558,6 +579,11 @@ export class SundialBabylon {
     }
   }
 
+  /** The depth this camera rendered into: its own target's, else Babylon's main one. */
+  private depthOf(camera: Camera): GPUTexture | undefined {
+    return cameraDepth(camera, this.scene) ?? (this.scene.getEngine() as unknown as { _depthTexture?: GPUTexture })._depthTexture;
+  }
+
   private update(): void {
     if (!this.enabled) return;
     if (this.rebuildPending) this.rebuild();
@@ -567,7 +593,7 @@ export class SundialBabylon {
     const eye = camera.globalPosition;
     const dir = this.light.direction;
     const engine = this.scene.getEngine() as WebGPUEngine;
-    const current = (engine as unknown as { _depthTexture?: GPUTexture })._depthTexture;
+    const current = this.depthOf(camera);
     // Mark only from a depth buffer we saw rendered, with the matrix it was
     // rendered with. After a resize Babylon has a fresh, empty depth texture:
     // skip marking for that one frame rather than mark garbage.
@@ -619,6 +645,15 @@ export class SundialBabylon {
   }
 }
 
+/**
+ * Plugins inject at the same point in priority order, so the shadow must come
+ * after anything that REPLACES the sun's colour there. Babylon's atmosphere
+ * plugin (600) assigns diffuse{k} from its transmittance LUT at
+ * CUSTOM_LIGHT{k}_COLOR; at 300 the shadow was applied first and overwritten,
+ * and a PBR receiver under a physical sky showed no shadow at all.
+ */
+const PLUGIN_PRIORITY = 700;
+
 const DEFINES: Record<string, boolean> = { PSENABLED: false };
 for (let k = 0; k < MAX_LIGHTS; k++) DEFINES[`PSLIGHT${k}`] = false;
 
@@ -635,7 +670,7 @@ class SundialPlugin extends MaterialPluginBase {
   readonly target: Material;
 
   constructor(material: Material, host: SundialBabylon) {
-    super(material, "Sundial", 300, { ...DEFINES });
+    super(material, "Sundial", PLUGIN_PRIORITY, { ...DEFINES });
     this.host = host;
     this.target = material;
     this._enable(true);

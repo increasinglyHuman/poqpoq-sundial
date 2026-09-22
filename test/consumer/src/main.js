@@ -1,21 +1,41 @@
 import "@babylonjs/core";
-import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, Vector3, Color3 } from "@babylonjs/core";
+import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, Vector3, Color3 } from "@babylonjs/core";
 import { SundialBabylon, readCoverage } from "@poqpoq/sundial/babylon";
 const r = (window.__result = { imported: true });
 try {
   const canvas = document.getElementById("c");
   const gpu = new URLSearchParams(location.search).get("engine") === "webgpu";
   let engine;
-  if (gpu) { engine = new WebGPUEngine(canvas, { enableAllFeatures: true, setMaximumLimits: true }); await engine.initAsync(); }
+  // ?nofeat=1: a device with no optional features (no clip-distances), like an engine created with defaults.
+  const bare = new URLSearchParams(location.search).get("nofeat") === "1";
+  if (gpu) { engine = new WebGPUEngine(canvas, bare ? {} : { enableAllFeatures: true, setMaximumLimits: true }); await engine.initAsync(); }
   else engine = new Engine(canvas, true);
   r.backend = gpu ? "webgpu" : "webgl2";
   r.supported = SundialBabylon.isSupported(engine);
   const scene = new Scene(engine);
   const cam = new FreeCamera("c", new Vector3(0, 14, -18), scene); cam.setTarget(Vector3.Zero());
+  // ?pp=1: the camera renders through a post-process, as World's world camera does (image processing
+  // into an HDR target), so its depth is the post-process target's, not Babylon's main depth buffer.
+  if (new URLSearchParams(location.search).get("pp") === "1") new ImageProcessingPostProcess("ip", 1.0, cam);
   const sun = new DirectionalLight("sun", new Vector3(-0.4, -1, 0.3), scene); sun.intensity = 1.2;
   new HemisphericLight("sky", new Vector3(0, 1, 0), scene).intensity = 0.3;
   const mat = new StandardMaterial("m", scene); mat.diffuseColor = new Color3(0.8, 0.8, 0.8);
   const ground = MeshBuilder.CreateGround("g", { width: 40, height: 40, subdivisions: 4 }, scene); ground.material = mat; ground.receiveShadows = true;
+  let pbrGround = null;
+  // ?pbr=1: the ground is PBR, with a stand-in for Babylon's atmosphere plugin (priority 600) that
+  // REPLACES the sun's colour at CUSTOM_LIGHT0_COLOR, as the real one does under a physical sky.
+  if (new URLSearchParams(location.search).get("pbr") === "1") {
+    const pbr = new PBRMaterial("pbrGround", scene); pbr.albedoColor = new Color3(0.8, 0.8, 0.8); pbr.metallic = 0; pbr.roughness = 1;
+    class SunReplacer extends MaterialPluginBase {
+      constructor(m) { super(m, "SunReplacer", 600, { SUNREPLACER: true }); this._enable(true); }
+      getClassName() { return "SunReplacer"; }
+      isCompatible() { return true; }
+      getCustomCode(type) { return type === "fragment" ? { CUSTOM_LIGHT0_COLOR: "diffuse0 = light0.vLightDiffuse;" } : null; }
+    }
+    new SunReplacer(pbr);
+    ground.material = pbr;
+    pbrGround = pbr;
+  }
   const box = MeshBuilder.CreateBox("b", { size: 3 }, scene); box.position.y = 3; box.material = mat;
   if (r.supported) {
     const sd = new SundialBabylon(scene, sun, { sceneMin: [-20, -1, -20], sceneMax: [20, 10, 20], levels: 5 });
@@ -41,7 +61,7 @@ try {
     leafMat.diffuseColor = new Color3(0.2, 0.8, 0.2);
     leafMat.useAlphaFromDiffuseTexture = true; // so the leaf renders cut out too (World's MASK rule)
     const leaf = MeshBuilder.CreatePlane("leaf", { size: 4 }, scene); leaf.position.set(-6, 2, 0); leaf.rotation.x = Math.PI / 2; leaf.material = leafMat; // flat, facing up: its shadow shows on the ground
-    sd.addCaster(ground); sd.addCaster(box); sd.addCaster(prim); sd.addCaster(leaf); sd.addReceivers([mat]); sd.start();
+    sd.addCaster(ground); sd.addCaster(box); sd.addCaster(prim); sd.addCaster(leaf); sd.addReceivers([mat, ...(pbrGround ? [pbrGround] : [])]); sd.start();
     r.core = () => sd.core.stats;
     r.firstBuild = sd.core.contentSummary;
     const gpuErrors = (r.gpuErrors = []);
@@ -77,13 +97,18 @@ try {
       sd.dispose();
       await frames(3);
       const sd2 = new SundialBabylon(scene, sun, { sceneMin: [-20, -1, -20], sceneMax: [20, 10, 20], levels: 5 });
-      sd2.addCaster(ground); sd2.addCaster(box); sd2.addReceivers([mat, late]); sd2.start();
+      sd2.addCaster(ground); sd2.addCaster(box); sd2.addReceivers([mat, late, ...(pbrGround ? [pbrGround] : [])]); sd2.start();
       await frames(30);
       r.second = {
         rebound: mat.pluginManager.getPlugin("Sundial").host === sd2 && late.pluginManager.getPlugin("Sundial").host === sd2,
         enabled: !!ground.subMeshes[0].materialDefines?.PSENABLED,
         requested: sd2.core.stats.requestedPages,
       };
+      // …and actually shades: darkness 1 must brighten the frame again.
+      r.second.luma0 = await meanLuma();
+      sd2.setDarkness(1); await frames(5);
+      r.second.luma1 = await meanLuma();
+      sd2.setDarkness(0);
       r.core = () => sd2.core.stats;
       r.done = true;
     })().catch((e) => { r.error = String(e); r.done = true; });

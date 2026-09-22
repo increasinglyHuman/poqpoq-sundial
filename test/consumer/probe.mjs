@@ -12,7 +12,7 @@ const server = await createServer({ root: import.meta.dirname, configFile: join(
 await server.listen();
 const b = await chromium.launch({ executablePath: exe, headless: false, args: ["--force_high_performance_gpu", "--enable-unsafe-webgpu"] });
 let failed = false;
-for (const engine of ["webgl2", "webgpu"]) {
+for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "webgpu&pbr=1"]) {
   const p = await b.newPage({ viewport: { width: 1200, height: 800 } });
   const errs = []; p.on("pageerror", (e) => errs.push(e.message)); p.on("console", (m) => { if (m.type() === "error" && !/404/.test(m.text())) errs.push(m.text().slice(0, 160)); });
   await p.goto(`http://localhost:5189/?engine=${engine}`);
@@ -21,7 +21,7 @@ for (const engine of ["webgl2", "webgpu"]) {
   await p.waitForTimeout(500);
   const res = await p.evaluate(() => { const r = window.__result; return { ...r, core: r.core ? (({ requestedPages, residentPages, allocationFailures, alphaPairs, opaquePairs }) => ({ requestedPages, residentPages, allocationFailures, alphaPairs, opaquePairs }))(r.core()) : undefined }; });
     const ok = res.imported && !res.error && errs.length === 0 &&
-    (engine === "webgl2" ? res.supported === false : res.supported === true && res.core.requestedPages > 0 && res.core.allocationFailures === 0 &&
+    (engine.startsWith("webgl2") ? res.supported === false : res.supported === true && res.core.requestedPages > 0 && res.core.allocationFailures === 0 &&
       // ground 32 + box 12 + the prim's 6 visible triangles (its hidden half must not cast) + leaf 2
       res.firstBuild.triangles === 52 && res.firstBuild.geometries === 4 &&
       res.rebuild?.cachedGeometries === 4 && res.rebuild.triangles === 52 && res.gpuErrors.length === 0 &&
@@ -29,12 +29,13 @@ for (const engine of ["webgl2", "webgpu"]) {
       res.orientation.topLeft === 255 && res.orientation.topRight === 0 && res.orientation.bottomLeft === 0 &&
       // the leaf's mask was read and it now casts through the alpha pipeline
       res.firstBuild.alphaClusters === 0 && res.rebuild.alphaClusters === 1 &&
-      // darkness 1 hides every shadow: the whole frame gets measurably brighter
-      res.lumaDark1 > res.lumaDark0 + 1 &&
+      // darkness 1 hides every shadow, so the frame gets brighter. The render is deterministic: with
+      // no shadow (the PBR case before the plugin-priority fix) the two frames are identical.
+      res.lumaDark1 > res.lumaDark0 + 0.1 &&
       // a material made after start() picked up the receiver on its own
       res.late.plugin && res.late.enabled &&
       // after dispose, a second instance took over the same materials and is paging
-      res.second.rebound && res.second.enabled && res.second.requested > 0);
+      res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1);
   failed ||= !ok;
   console.log(ok ? "PASS" : "FAIL", engine, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "");
   await p.close();
