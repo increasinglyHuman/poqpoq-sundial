@@ -200,6 +200,30 @@ export class PagedShadowCore {
   /** Keys registered since the last clearContent(), and the geometry index each got. */
   private geometryKeys = new Map<string, number>();
   private cacheHits = 0;
+  /** Each registered geometry's key, in order (null = registered without one). */
+  private geometryKeyOrder: (string | null)[] = [];
+  /**
+   * The packed geometry of the last build: vertex and index buffers, and the
+   * cluster half of the scene buffer. Reused as-is while the ordered geometry
+   * keys are unchanged, so a rebuild that only moves, adds or drops instances
+   * re-packs nothing.
+   */
+  private packed: {
+    keys: string;
+    vertexBuffer: GPUBuffer;
+    indexBuffer: GPUBuffer;
+    clusterVec: Float32Array;
+    geomClusterStart: number[];
+    clusterCount: number;
+  } | null = null;
+  /**
+   * The previous content, snapshot by clearContent() while it was live: each
+   * instance's signature (geometry key + matrix) with its world bounds. The next
+   * build() re-renders only the pages under instances that appeared or went.
+   */
+  private previousInstances: Map<string, [Vec3, Vec3][]> | null = null;
+  /** What the last build() did, for hosts to report. */
+  lastBuild = { reusedGeometry: false, invalidated: "all" as "all" | number };
   private groups: InstanceGroup[] = [];
   private instanceMatrices: number[] = []; // 12 floats (3 affine rows) per instance
   private instanceGeometry: number[] = [];
@@ -316,23 +340,28 @@ export class PagedShadowCore {
    * Register a geometry. With a `key`, geometry registered again under the
    * same key reuses its clusters: within one build it is the same geometry
    * (instances share it), and across rebuilds the clustering is not redone.
-   * The key must change whenever the input does.
+   * The key must change whenever the input does. `input` may be a function:
+   * it is then called only when the key is not cached, so a host can skip
+   * preparing geometry that will not be used.
    */
-  addGeometry(input: GeometryInput, key?: string): number {
+  addGeometry(input: GeometryInput | (() => GeometryInput), key?: string): number {
+    const resolve = () => (typeof input === "function" ? input() : input);
     if (key !== undefined) {
       const known = this.geometryKeys.get(key);
       if (known !== undefined) return known;
       let built = this.geometryCache.get(key);
       if (built) this.cacheHits++;
       else {
-        built = buildGeometry(input, this.clusterTris);
+        built = buildGeometry(resolve(), this.clusterTris);
         this.geometryCache.set(key, built);
       }
       this.geometries.push(built);
+      this.geometryKeyOrder.push(key);
       this.geometryKeys.set(key, this.geometries.length - 1);
       return this.geometries.length - 1;
     }
-    this.geometries.push(buildGeometry(input, this.clusterTris));
+    this.geometries.push(buildGeometry(resolve(), this.clusterTris));
+    this.geometryKeyOrder.push(null);
     return this.geometries.length - 1;
   }
 
@@ -341,7 +370,12 @@ export class PagedShadowCore {
    * content again and build(). Clustered geometry stays cached by key.
    */
   clearContent(): void {
+    // Only live content can be diffed against: before the first build there are
+    // no cached pages to spare, and an unkeyed geometry has no stable identity.
+    this.previousInstances =
+      this.started && this.sceneBuffer && !this.geometryKeyOrder.includes(null) ? this.instanceSignatures() : null;
     this.geometries = [];
+    this.geometryKeyOrder = [];
     this.geometryKeys.clear();
     this.cacheHits = 0;
     this.groups = [];
@@ -447,72 +481,91 @@ export class PagedShadowCore {
 
   /**
    * Pack all registered content into GPU buffers. Call after adding content;
-   * call again after clearContent() and re-registering to replace it. A
-   * rebuild frees the previous buffers and re-renders every cached page.
+   * call again after clearContent() and re-registering to replace it. A rebuild
+   * reuses the packed geometry when the ordered geometry keys are unchanged,
+   * and re-renders only the pages under instances that appeared, went or moved
+   * (every page when that cannot be told, or when too much changed).
    */
   build(): void {
-    this.destroyContentBuffers();
+    const keys = this.geometryKeyOrder.includes(null) ? null : this.geometryKeyOrder.join("\n");
+    const reuse = keys !== null && this.packed?.keys === keys;
+    this.destroyContentBuffers(reuse);
     for (const key of this.geometryCache.keys()) if (!this.geometryKeys.has(key)) this.geometryCache.delete(key);
-    if (this.started) this.invalidateAll();
-    const clusterRecords: { geom: number; base: number }[] = [];
-    let vertexBase = 0;
-    let indexBase = 0;
-    const vertexData: Float32Array[] = [];
-    const indexData: Uint32Array[] = [];
-    const geomClusterStart: number[] = [];
-    const sceneVec: number[] = [];
-    for (let g = 0; g < this.geometries.length; g++) {
-      const geo = this.geometries[g];
-      const vcount = geo.positions.length / 3;
-      const v = new Float32Array(vcount * 5);
-      for (let i = 0; i < vcount; i++) {
-        v[i * 5] = geo.positions[i * 3];
-        v[i * 5 + 1] = geo.positions[i * 3 + 1];
-        v[i * 5 + 2] = geo.positions[i * 3 + 2];
-        v[i * 5 + 3] = geo.uvs[i * 2];
-        v[i * 5 + 4] = geo.uvs[i * 2 + 1];
+
+    if (!reuse) {
+      let vertexBase = 0;
+      let indexBase = 0;
+      const vertexData: Float32Array[] = [];
+      const indexData: Uint32Array[] = [];
+      const geomClusterStart: number[] = [];
+      let clusterCount = 0;
+      for (const geo of this.geometries) clusterCount += geo.clusters.length;
+      const clusterVec = new Float32Array(clusterCount * 12);
+      const clusterU = new Uint32Array(clusterVec.buffer);
+      let c = 0;
+      for (let g = 0; g < this.geometries.length; g++) {
+        const geo = this.geometries[g];
+        const vcount = geo.positions.length / 3;
+        const v = new Float32Array(vcount * 5);
+        for (let i = 0; i < vcount; i++) {
+          v[i * 5] = geo.positions[i * 3];
+          v[i * 5 + 1] = geo.positions[i * 3 + 1];
+          v[i * 5 + 2] = geo.positions[i * 3 + 2];
+          v[i * 5 + 3] = geo.uvs[i * 2];
+          v[i * 5 + 4] = geo.uvs[i * 2 + 1];
+        }
+        vertexData.push(v);
+        const idx = new Uint32Array(geo.indices.length);
+        for (let i = 0; i < idx.length; i++) idx[i] = geo.indices[i] + vertexBase;
+        indexData.push(idx);
+        geomClusterStart.push(c);
+        for (const cl of geo.clusters) {
+          const o = c * 12;
+          clusterVec.set(cl.aabbMin, o);
+          clusterU[o + 3] = cl.firstIndex + indexBase;
+          clusterVec.set(cl.aabbMax, o + 4);
+          clusterU[o + 7] = cl.triCount;
+          clusterU[o + 8] = cl.alphaLayer;
+          clusterVec[o + 9] = cl.alphaCutoff;
+          c++;
+        }
+        vertexBase += vcount;
+        indexBase += idx.length;
       }
-      vertexData.push(v);
-      const idx = new Uint32Array(geo.indices.length);
-      for (let i = 0; i < idx.length; i++) idx[i] = geo.indices[i] + vertexBase;
-      indexData.push(idx);
-      geomClusterStart.push(clusterRecords.length);
-      for (const cl of geo.clusters) {
-        clusterRecords.push({ geom: g, base: indexBase });
-        const f = new Float32Array(12);
-        const u = new Uint32Array(f.buffer);
-        f.set(cl.aabbMin, 0);
-        u[3] = cl.firstIndex + indexBase;
-        f.set(cl.aabbMax, 4);
-        u[7] = cl.triCount;
-        u[8] = cl.alphaLayer;
-        f[9] = cl.alphaCutoff;
-        sceneVec.push(...f);
-      }
-      vertexBase += vcount;
-      indexBase += idx.length;
+      const vertexBuffer = this.upload("ps.vertices", concatF32(vertexData), STORAGE);
+      const indexBuffer = this.upload("ps.indices", concatU32(indexData), STORAGE);
+      // Unkeyed geometry has no identity to compare next time: a key no rebuild can match.
+      this.packed = { keys: keys ?? "\u0000unkeyed", vertexBuffer, indexBuffer, clusterVec, geomClusterStart, clusterCount };
     }
-    this.clusterCount = clusterRecords.length;
+    const { clusterVec, geomClusterStart, clusterCount, vertexBuffer, indexBuffer } = this.packed!;
+    this.clusterCount = clusterCount;
+    this.vertexBuffer = vertexBuffer;
+    this.indexBuffer = indexBuffer;
 
     // Cluster instances: every cluster of an instance's geometry.
-    const ci: number[] = [];
+    let pairs = 0;
+    for (let inst = 0; inst < this.instanceGeometry.length; inst++) pairs += this.geometries[this.instanceGeometry[inst]].clusters.length;
+    const ci = new Uint32Array(pairs * 2);
+    let w = 0;
     for (let inst = 0; inst < this.instanceGeometry.length; inst++) {
       const g = this.instanceGeometry[inst];
       const start = geomClusterStart[g];
       const n = this.geometries[g].clusters.length;
-      for (let c = 0; c < n; c++) ci.push(start + c, inst);
+      for (let k = 0; k < n; k++) {
+        ci[w++] = start + k;
+        ci[w++] = inst;
+      }
     }
-    this.clusterInstanceCount = ci.length / 2;
+    this.clusterInstanceCount = pairs;
 
-    const scene = new Float32Array(sceneVec.length + this.instanceMatrices.length);
-    scene.set(sceneVec, 0);
-    scene.set(this.instanceMatrices, sceneVec.length);
+    const scene = new Float32Array(clusterVec.length + this.instanceMatrices.length);
+    scene.set(clusterVec, 0);
+    scene.set(this.instanceMatrices, clusterVec.length);
 
     this.sceneBuffer = this.upload("ps.scene", scene, STORAGE | COPY_DST);
-    this.clusterInstanceBuffer = this.upload("ps.clusterInstances", new Uint32Array(ci), STORAGE);
-    this.vertexBuffer = this.upload("ps.vertices", concatF32(vertexData), STORAGE);
-    this.indexBuffer = this.upload("ps.indices", concatU32(indexData), STORAGE);
+    this.clusterInstanceBuffer = this.upload("ps.clusterInstances", ci, STORAGE);
     this.dirtyInstances.clear();
+    this.lastBuild = { reusedGeometry: reuse, invalidated: this.started ? this.invalidateChanged() : 0 };
 
     const d = this.device;
     this.computeGroup = d.createBindGroup({
@@ -537,7 +590,7 @@ export class PagedShadowCore {
 
   /** Free every GPU resource. The core cannot be used afterwards. */
   dispose(): void {
-    this.destroyContentBuffers();
+    this.destroyContentBuffers(false);
     for (const b of [this.paramsBuffer, this.pageTableBuffer, this.requestBuffer, this.counterBuffer, this.workBuffer, this.pairBuffer]) b.destroy();
     for (const rb of this.readbacks) rb.buffer.destroy();
     this.queryResolve?.destroy();
@@ -548,16 +601,70 @@ export class PagedShadowCore {
     this.depthBinding = null;
   }
 
-  private destroyContentBuffers(): void {
-    for (const b of [this.sceneBuffer, this.clusterInstanceBuffer, this.vertexBuffer, this.indexBuffer]) b?.destroy();
+  /** Free the content buffers; with `keepGeometry`, keep the packed vertex and index buffers. */
+  private destroyContentBuffers(keepGeometry = false): void {
+    for (const b of [this.sceneBuffer, this.clusterInstanceBuffer]) b?.destroy();
+    if (!keepGeometry) {
+      this.packed?.vertexBuffer.destroy();
+      this.packed?.indexBuffer.destroy();
+      this.packed = null;
+    }
     this.sceneBuffer = this.clusterInstanceBuffer = this.vertexBuffer = this.indexBuffer = null;
     this.computeGroup = this.rasterGroup = null;
+  }
+
+  /** Every live instance's signature (geometry key + matrix) with its world bounds. */
+  private instanceSignatures(): Map<string, [Vec3, Vec3][]> {
+    const out = new Map<string, [Vec3, Vec3][]>();
+    const m = this.instanceMatrices;
+    for (let inst = 0; inst < this.instanceGeometry.length; inst++) {
+      const o = inst * 12;
+      const sig = `${this.geometryKeyOrder[this.instanceGeometry[inst]]}|${m[o]},${m[o + 1]},${m[o + 2]},${m[o + 3]},${m[o + 4]},${m[o + 5]},${m[o + 6]},${m[o + 7]},${m[o + 8]},${m[o + 9]},${m[o + 10]},${m[o + 11]}`;
+      let list = out.get(sig);
+      if (!list) out.set(sig, (list = []));
+      list.push(this.instanceBounds(inst));
+    }
+    return out;
+  }
+
+  /**
+   * Re-render the pages under instances that differ from the snapshot taken by
+   * clearContent(): the ones that went (at their old bounds) and the ones that
+   * came (at their new bounds); an instance that moved is both. Returns how
+   * many boxes were invalidated, or "all" when the difference was unknown or too
+   * large for per-box invalidation.
+   */
+  private invalidateChanged(): "all" | number {
+    const before = this.previousInstances;
+    this.previousInstances = null;
+    if (!before || this.geometryKeyOrder.includes(null)) {
+      this.invalidateAll();
+      return "all";
+    }
+    const after = this.instanceSignatures();
+    const boxes: [Vec3, Vec3][] = [];
+    for (const [sig, olds] of before) {
+      const kept = after.get(sig)?.length ?? 0;
+      for (let i = kept; i < olds.length; i++) boxes.push(olds[i]);
+    }
+    for (const [sig, news] of after) {
+      const had = before.get(sig)?.length ?? 0;
+      for (let i = had; i < news.length; i++) boxes.push(news[i]);
+    }
+    if (this.regions.length / 8 + boxes.length > MAX_REGIONS) {
+      this.invalidateAll();
+      return "all";
+    }
+    for (const [min, max] of boxes) this.invalidateBox(min, max);
+    return boxes.length;
   }
 
   get contentSummary() {
     return {
       /** Geometries registered since clearContent() that reused cached clusters. */
       cachedGeometries: this.cacheHits,
+      /** The last build kept the packed geometry, and how much it re-rendered ("all" or boxes). */
+      lastBuild: { ...this.lastBuild },
       geometries: this.geometries.length,
       /** Clusters that cast through an alpha mask. */
       alphaClusters: this.geometries.reduce((s, g) => s + g.clusters.filter((c) => c.alphaLayer !== 0xffffffff).length, 0),

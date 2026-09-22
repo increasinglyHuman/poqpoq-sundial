@@ -135,6 +135,18 @@ try {
         sd.setCasters([...base, { mesh: pillars, options: { instanceMatrices: canon } }]); await frames(30);
         r.instanceCanon = await meanLuma();
         sd.setCasters(base); pillars.dispose(); await frames(10);
+        // Rebuilds re-render only what changed (the rebuild-hitch fix). Unchanged content repacks
+        // nothing and re-renders nothing; one added box re-renders its own footprint and its shadow
+        // appears; removing it re-renders that footprint again and the frame is exactly as before.
+        await frames(20);
+        r.lumaBase = await meanLuma();
+        sd.setCasters(base); await frames(20);
+        r.rebuildSame = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
+        const extra = MeshBuilder.CreateBox("extra", { size: 2 }, scene); extra.position.set(4, 3, -4); extra.material = mat;
+        sd.setCasters([...base, extra]); await frames(20);
+        r.rebuildAdd = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
+        sd.setCasters(base); extra.dispose(); await frames(20);
+        r.rebuildRemove = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
       }
       // Requests are per frame (review F1, PR #9): look at empty sky and the pages the ground asked
       // for must stop being requested. If the request buffer were never cleared they would stay.
