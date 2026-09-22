@@ -1,6 +1,7 @@
 import { WebGPUEngine } from "@babylonjs/core/Engines/webgpuEngine";
 import { Scene } from "@babylonjs/core/scene";
 import { UniversalCamera } from "@babylonjs/core/Cameras/universalCamera";
+import { FreeCamera } from "@babylonjs/core/Cameras/freeCamera";
 import { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import { HemisphericLight } from "@babylonjs/core/Lights/hemisphericLight";
 import { CascadedShadowGenerator } from "@babylonjs/core/Lights/Shadows/cascadedShadowGenerator";
@@ -111,6 +112,7 @@ async function main() {
     poolSize: 4096,
     finestPageWorldSize: 1,
     renderBudget: num("budget", 96),
+    clipDistances: q.get("clip") !== "0",
   });
   sundial.setAlphaMask(0, world.leafMask, 0.5);
   sundial.addCaster(world.terrain);
@@ -143,6 +145,20 @@ async function main() {
   sundial.core.tuning.debugMode = q.get("debug") === "1" ? 1 : 0;
   sundial.core.tuning.lodBias = num("lodBias", 0);
   sundial.core.markStride = num("stride", 2);
+  // ?hud=1: a second, HUD-style camera rendered after the world camera, as in
+  // World (HUDSystem pushes hudCamera onto activeCameras, and the scene clears
+  // depth and stencil automatically). Marking must keep reading WORLD depth.
+  if (q.get("hud") === "1") {
+    scene.autoClearDepthAndStencil = true;
+    const hudCam = new FreeCamera("hudCamera", new Vector3(0, 0, -5), scene);
+    hudCam.mode = FreeCamera.ORTHOGRAPHIC_CAMERA;
+    hudCam.orthoLeft = -2; hudCam.orthoRight = 2; hudCam.orthoTop = 1.2; hudCam.orthoBottom = -1.2;
+    hudCam.layerMask = 0x10000000; // a bit no world mesh carries (Babylon's default mask is 0x0FFFFFFF)
+    const badge = MeshBuilder.CreatePlane("hudBadge", { size: 0.3 }, scene);
+    badge.position.set(1.6, 0.9, 0);
+    badge.layerMask = 0x10000000;
+    scene.activeCameras = [camera, hudCam];
+  }
   sundial.start();
 
   // ---- CSM, configured like ShadowDirector's tiers ------------------------------

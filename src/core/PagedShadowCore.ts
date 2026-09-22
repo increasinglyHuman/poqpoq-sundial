@@ -49,6 +49,12 @@ export interface PagedShadowOptions {
   clusterTris?: number;
   alphaTextureSize?: number;
   maxAlphaLayers?: number;
+  /**
+   * Clip triangles to their page with the `clip-distances` feature (default:
+   * when the device has it). false forces the fragment-discard fallback, which
+   * is what runs on a device created without that feature.
+   */
+  clipDistances?: boolean;
 }
 
 export interface FrameInput {
@@ -229,7 +235,7 @@ export class PagedShadowCore {
     this.tuning.renderBudget = options.renderBudget ?? this.tuning.renderBudget;
     this.slots = this.levelCount * this.pagesPerSide * this.pagesPerSide;
     this.work = workLayout(this.slots, this.pageCount, this.renderBudgetMax);
-    this.useClipDistances = device.features.has("clip-distances");
+    this.useClipDistances = device.features.has("clip-distances") && options.clipDistances !== false;
     this.hasTimestamps = device.features.has("timestamp-query");
 
     this.paramsBuffer = device.createBuffer({ label: "ps.params", size: PARAMS_BYTES, usage: STORAGE | COPY_DST });
@@ -488,7 +494,10 @@ export class PagedShadowCore {
 
     const enc = d.createCommandEncoder({ label: "ps.frame" });
     enc.clearBuffer(this.counterBuffer);
-    enc.clearBuffer(this.requestBuffer);
+    // Legacy path: mark from last frame's depth at the start of this frame.
+    // With markInto(), requests were written during the previous frame and
+    // are consumed here, then cleared after paging.
+    if (depth) enc.clearBuffer(this.requestBuffer);
 
     const wg = (n: number) => Math.max(1, Math.ceil(n / 64));
     const k = this.kernels;
@@ -526,6 +535,7 @@ export class PagedShadowCore {
     cp.setPipeline(k.finalizeDraws);
     cp.dispatchWorkgroups(1);
     cp.end();
+    if (!depth) enc.clearBuffer(this.requestBuffer);
 
     const rp = enc.beginRenderPass({
       label: "ps.raster",
@@ -559,6 +569,36 @@ export class PagedShadowCore {
     }
     d.queue.submit([enc.finish()]);
     if (rb) this.readStats(rb, this.frame);
+  }
+
+  /**
+   * Mark pages from a camera depth buffer inside the HOST's command encoder,
+   * right after the camera that produced it has rendered and before anything
+   * else (a HUD camera, a post-process) can clear or overwrite that depth.
+   * The requests are consumed by the next update(). Use this instead of
+   * FrameInput.depth whenever the host lets you encode mid-frame.
+   */
+  markInto(encoder: GPUCommandEncoder, depth: { texture: GPUTexture; invViewProj: ArrayLike<number> }): void {
+    if (!this.computeGroup) return;
+    const bound = this.bindDepth(depth.texture);
+    const block = new Float32Array(20);
+    block.set(Array.from(depth.invViewProj).slice(0, 16), 0);
+    block.set([depth.texture.width, depth.texture.height, this.markStride, 1], 16);
+    this.device.queue.writeBuffer(this.paramsBuffer, 20 * 4, block);
+    const mp = encoder.beginComputePass({
+      label: "ps.mark",
+      timestampWrites: this.querySet
+        ? { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
+        : undefined,
+    });
+    mp.setBindGroup(0, this.computeGroup);
+    mp.setPipeline(bound.pipeline);
+    mp.setBindGroup(1, bound.group);
+    mp.dispatchWorkgroups(
+      Math.ceil(depth.texture.width / this.markStride / 8),
+      Math.ceil(depth.texture.height / this.markStride / 8),
+    );
+    mp.end();
   }
 
   // ---- internals --------------------------------------------------------------

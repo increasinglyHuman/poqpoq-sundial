@@ -147,9 +147,18 @@ export class SundialBabylon {
     return !!engine.isWebGPU && !!(engine as unknown as { _device?: GPUDevice })._device;
   }
 
-  constructor(scene: Scene, light: DirectionalLight, options: PagedShadowOptions) {
+  /**
+   * The camera whose depth buffer drives page marking, and whose position
+   * picks the clipmap level. Defaults to the first active camera, then the
+   * scene's active camera. World renders a HUD camera after the world camera,
+   * so it must name the world camera explicitly.
+   */
+  getCamera: () => Camera | null;
+
+  constructor(scene: Scene, light: DirectionalLight, options: PagedShadowOptions & { getCamera?: () => Camera | null }) {
     this.scene = scene;
     this.light = light;
+    this.getCamera = options.getCamera ?? (() => scene.activeCameras?.[0] ?? scene.activeCamera);
     const engine = scene.getEngine() as WebGPUEngine;
     if (!engine.isWebGPU) throw new Error("Sundial needs the WebGPU engine");
     makeMainDepthReadable(engine);
@@ -219,19 +228,39 @@ export class SundialBabylon {
     this.afterCameraObserver?.remove();
   }
 
-  /** Snapshot what the main camera's depth buffer was rendered with (review F1). */
+  /**
+   * Mark pages right after the world camera renders, inside Babylon's own
+   * frame encoder, while its depth is intact and exactly matches this
+   * camera's matrix. A later camera (World's HUD) clears depth, so reading it
+   * at the next frame's start would see an almost empty buffer (measured:
+   * 153 → 32 pages requested, a blurry fallback everywhere). Ends Babylon's
+   * current render pass; Babylon restarts it lazily with load ops.
+   */
   private captureDepth(camera: Camera): void {
-    if (camera !== this.scene.activeCamera) return;
-    const depth = (this.scene.getEngine() as unknown as { _depthTexture?: GPUTexture })._depthTexture;
+    if (!this.enabled || camera !== this.getCamera()) return;
+    const engine = this.scene.getEngine() as unknown as {
+      _depthTexture?: GPUTexture;
+      _renderEncoder?: GPUCommandEncoder;
+      _endCurrentRenderPass?: () => void;
+    };
+    const depth = engine._depthTexture;
     if (!depth) return;
     camera.getTransformationMatrix().invertToRef(this.scratch);
-    this.depthSnapshot = { texture: depth, invViewProj: new Float32Array(this.scratch.m) };
+    if (engine._renderEncoder && engine._endCurrentRenderPass) {
+      engine._endCurrentRenderPass();
+      this.core.markInto(engine._renderEncoder, { texture: depth, invViewProj: this.scratch.m });
+      this.depthSnapshot = null;
+    } else {
+      // No mid-frame access: fall back to marking at the next frame's start.
+      this.depthSnapshot = { texture: depth, invViewProj: new Float32Array(this.scratch.m) };
+    }
   }
 
   private update(): void {
     if (!this.enabled) return;
     this.updateDynamics();
-    const camera = this.scene.activeCamera as Camera;
+    const camera = this.getCamera();
+    if (!camera) return;
     const eye = camera.globalPosition;
     const dir = this.light.direction;
     const engine = this.scene.getEngine() as WebGPUEngine;
