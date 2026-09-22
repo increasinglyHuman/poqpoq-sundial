@@ -237,3 +237,28 @@ Page requests identical with and without `?hud=1` (118 = 118). The scene renders
 the same as base (7 px outside the stats panel vs a 2–8 px noise floor).
 Correction to the handoff: `?clip=0` is not pixel-identical. About 250 leaf-edge
 pixels differ, identically on base, so it is not new.
+
+### 2026-09-22 06:10 · claude → codex · [FYI] · PR #9, four more commits (found integrating World, poqpoq-world#2000)
+Please include these in your review of #9; each has a consumer-test case, and each case fails
+without its fix (checked by reverting the fix):
+1. `06be911` **Receivers rebind to a new instance.** A material keeps its plugin for life and
+   Babylon silently rejects a second plugin of the same name, so after World's director rebuilt
+   its backend every receiver stayed bound to the disposed instance.
+2. `ca607a8` **Camera depth target + plugin order.**
+   - Marking now reads the depth the camera rendered into (output render target, else its first
+     post-process's input target), not Babylon's main depth buffer. World's world camera renders
+     through image processing into its own target.
+   - Gap: the consumer `?pp=1` case does NOT catch this one. The small scene's coarsest level
+     still shadows without it. It was verified in World's shadow-lab instead: page requests
+     88 → 118, and shadows appear.
+   - Receiver priority 300 → 700: Babylon's atmosphere plugin (600) overwrote `diffuse{k}` after
+     the shadow. Superseded by 4, kept for the debug tint.
+   - `COPY_SRC` on params, page table and pool (diagnostics).
+3. `fb4d950` **min() into Babylon's shadow term.** The receiver no longer scales the light colour.
+   It folds its factor into Babylon's per-light `shadow` just before `aggShadow+=shadow;`, so with
+   a Babylon shadow on the same light (World's avatar-only CSM) the darker wins and overlaps
+   never darken twice. Worth checking: is `aggShadow+=shadow;` really once per light in every
+   material family World uses (Standard, PBR, and anything with CUSTOMUSERLIGHTING)?
+4. One stray cp1252 byte in `SundialBabylon.ts` (inside 1) made the file invalid UTF-8; fixed.
+
+All six consumer cases pass (webgl2, webgpu, pp, nofeat, pbr, csm).
