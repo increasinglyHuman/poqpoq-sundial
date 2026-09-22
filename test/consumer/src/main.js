@@ -118,6 +118,18 @@ try {
       lateGround.material = late; lateGround.receiveShadows = true;
       await frames(10);
       r.late = { plugin: !!late.pluginManager?.getPlugin("Sundial"), enabled: !!lateGround.subMeshes[0].materialDefines?.PSENABLED };
+      // Cloning a receiver (World's face split, media apply) must not throw, and the clone receives
+      // like any new material (field 2026-09-22: "BABYLON.SundialPlugin not found" on clone).
+      try {
+        const copy = late.clone("late-copy");
+        const copyGround = MeshBuilder.CreateGround("cg", { width: 6, height: 6 }, scene); copyGround.position.set(8, 0.01, 8);
+        copyGround.material = copy; copyGround.receiveShadows = true;
+        const json = late.serialize();
+        await frames(10);
+        r.clone = { ok: true, plugin: copy.pluginManager?.getPlugin("Sundial")?.host === sd, enabled: !!copyGround.subMeshes[0].materialDefines?.PSENABLED, serialized: !JSON.stringify(json).includes("SundialPlugin") };
+      } catch (e) {
+        r.clone = { ok: false, error: String(e).slice(0, 160) };
+      }
       // A thin host whose live buffer is a VIEW (World's distance culling zero-scales far members):
       // registered with its real transforms via instanceMatrices, the hidden member still casts.
       {

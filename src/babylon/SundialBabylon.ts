@@ -703,6 +703,12 @@ class SundialPlugin extends MaterialPluginBase {
     super(material, "Sundial", PLUGIN_PRIORITY, { ...DEFINES });
     this.host = host;
     this.target = material;
+    // Never serialized: Material.clone() (and parse) rebuilds plugins by class
+    // name through Babylon's type registry, which cannot construct this one (it
+    // needs its host), so a clone threw "BABYLON.SundialPlugin not found" (field
+    // 2026-09-22, World's face split). A clone is a new material instead, and
+    // start()'s onNewMaterialAdded observer attaches a fresh plugin to it.
+    this.doNotSerialize = true;
     this._enable(true);
   }
 
