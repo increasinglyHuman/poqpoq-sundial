@@ -3,12 +3,13 @@
 // per view and each figure reported is the median across rounds.
 // Pass times are sampled on stats-readback frames, which over-represent page
 // refresh frames under motion: read them as upper bounds.
-// usage: [VIEWS=a,b] [MODES=x,y] [ROUNDS=3] node scripts/bench.mjs [extraQuery] [sampleMs]
+// usage: [VIEWS=a,b] [MODES=x,y] [ROUNDS=3] [PORT=5188] node scripts/bench.mjs [extraQuery] [sampleMs]
 import { chromium } from "playwright-core";
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const extra = process.argv[2] ?? "";
+const port = process.env.PORT ?? 5188;
 const sampleMs = Number(process.argv[3] ?? 3000);
 const rounds = Number(process.env.ROUNDS ?? 3);
 const root = join(process.env.LOCALAPPDATA, "ms-playwright");
@@ -39,7 +40,7 @@ let adapter = "";
 // transient state (measured: 23.8 vs 6.8 ms for the same page). Warm every
 // mode once, and load a cheap flush page before every measured run.
 const load = async (query, settle) => {
-  await page.goto(`http://localhost:5188/?${query}`);
+  await page.goto(`http://localhost:${port}/?${query}`);
   await page.waitForFunction(() => window.__ready === true, null, { timeout: 60000 });
   await page.waitForTimeout(settle);
 };
