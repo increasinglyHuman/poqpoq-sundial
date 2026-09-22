@@ -7,9 +7,11 @@ export const MAX_LEVELS = 8;
 /** Byte size of one PsLevel (7 × vec4). */
 export const LEVEL_BYTES = 7 * 16;
 /** Byte offset of the invalidation regions that trail PsParams. */
-export const PARAMS_HEADER_BYTES = 5 * 16 + 64 + 16 + MAX_LEVELS * LEVEL_BYTES;
+export const PARAMS_HEADER_BYTES = 5 * 16 + 64 + 2 * 16 + MAX_LEVELS * LEVEL_BYTES;
 /** u32 word offset of levels[0] in PsParams. */
-export const LEVELS_WORD = (5 * 16 + 64 + 16) / 4;
+export const LEVELS_WORD = (5 * 16 + 64 + 2 * 16) / 4;
+/** u32 word offset of PsParams.shade. */
+export const SHADE_WORD = (5 * 16 + 64 + 16) / 4;
 /** Invalidation boxes accepted per frame (each is two vec4f). */
 export const MAX_REGIONS = 256;
 export const PARAMS_BYTES = PARAMS_HEADER_BYTES + MAX_REGIONS * 32;
@@ -41,6 +43,7 @@ struct PsParams {
   misc: vec4u,    // x = invalidation region count, y = cluster instance count, z = max pairs, w = cluster count
   invViewProj: mat4x4f, // camera clip -> world, for the frame whose depth is being marked
   screen: vec4f,  // x = depth width, y = depth height, z = marking stride in pixels, w = 1 when depth is bound
+  shade: vec4f,   // x = darkness: light left in full shadow (0 = black, 1 = no shadow), as Babylon's setDarkness
   levels: array<PsLevel, PS_MAX_LEVELS>,
   regions: array<vec4f>, // world-space invalidation boxes as (min, max) pairs
 };
@@ -108,8 +111,13 @@ fn psFetch(level: u32, centerPage: vec2i, centerPhys: u32, t: vec2i) -> f32 {
   return textureLoad(psPool, atlas, 0);
 }
 
-// Returns 1 for fully lit, 0 for fully shadowed.
+// Light factor for a receiver: 1 fully lit, the darkness in full shadow.
 fn psShadow(posW: vec3f, normalW: vec3f) -> f32 {
+  return mix(psParams.shade.x, 1.0, psVisibility(posW, normalW));
+}
+
+// Returns 1 for fully lit, 0 for fully shadowed.
+fn psVisibility(posW: vec3f, normalW: vec3f) -> f32 {
   let nl = psParams.grid.x;
   let n = i32(psParams.grid.y);
   let s = f32(psParams.pool.z);

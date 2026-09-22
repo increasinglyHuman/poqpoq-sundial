@@ -18,7 +18,7 @@ import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
 import { Matrix } from "@babylonjs/core/Maths/math.vector";
 import { WebGPUDataBuffer } from "@babylonjs/core/Meshes/WebGPU/webgpuDataBuffer";
 import { GetTextureDataAsync } from "@babylonjs/core/Misc/textureTools";
-import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions } from "../core/PagedShadowCore";
+import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
 import { COMMON_WGSL, RECEIVER_WGSL } from "../core/wgsl";
 
 // Babylon adapter. The core owns every GPU resource and runs on Babylon's own
@@ -151,6 +151,26 @@ export async function readCoverage(texture: BaseTexture, size: number): Promise<
   const px = new Uint8ClampedArray(size * size * 4);
   px.set(new Uint8Array(data.buffer, data.byteOffset, px.length));
   return px;
+}
+
+/** Options for SundialBabylon: the core's, plus the adapter's own. */
+export interface SundialBabylonOptions extends PagedShadowOptions {
+  /** See SundialBabylon.getCamera. */
+  getCamera?: () => Camera | null;
+  /**
+   * Which materials created after start() become receivers automatically.
+   * Default: StandardMaterial and PBRMaterial. Return false to leave one
+   * alone; pass () => false to turn it off. Only WGSL materials of the
+   * classes that support plugins can receive.
+   */
+  receiveNewMaterials?: (material: Material) => boolean;
+}
+
+const RECEIVER_CLASSES = new Set(["StandardMaterial", "PBRMaterial"]);
+
+/** Whether the receiver plugin can attach: a plugin-capable class, and WGSL (the receiver is WGSL only). */
+function canReceive(material: Material): boolean {
+  return RECEIVER_CLASSES.has(material.getClassName()) && material.shaderLanguage === ShaderLanguage.WGSL;
 }
 
 /** A caster for setCasters(): a mesh, or a mesh with its options. */
@@ -310,10 +330,14 @@ export class SundialBabylon {
    */
   getCamera: () => Camera | null;
 
-  constructor(scene: Scene, light: DirectionalLight, options: PagedShadowOptions & { getCamera?: () => Camera | null }) {
+  private readonly receiveNewMaterials: (material: Material) => boolean;
+  private newMaterialObserver: Observer<Material> | null = null;
+
+  constructor(scene: Scene, light: DirectionalLight, options: SundialBabylonOptions) {
     this.scene = scene;
     this.light = light;
     this.getCamera = options.getCamera ?? (() => scene.activeCameras?.[0] ?? scene.activeCamera);
+    this.receiveNewMaterials = options.receiveNewMaterials ?? (() => true);
     const engine = scene.getEngine() as WebGPUEngine;
     if (!engine.isWebGPU) throw new Error("Sundial needs the WebGPU engine");
     makeMainDepthReadable(engine);
@@ -438,11 +462,24 @@ export class SundialBabylon {
     this.core.setAlphaLayer(layer, source, cutoff);
   }
 
-  /** Attach the receiver to materials. Meshes must also have `receiveShadows`. */
+  /**
+   * Attach the receiver to materials. Meshes must also have `receiveShadows`.
+   * Materials that cannot take the plugin (other classes, GLSL) are skipped.
+   */
   addReceivers(materials: Material[]): void {
     for (const m of materials) {
-      if (!this.plugins.some((p) => p.target === m)) this.plugins.push(new SundialPlugin(m, this));
+      if (canReceive(m) && !this.plugins.some((p) => p.target === m)) this.plugins.push(new SundialPlugin(m, this));
     }
+  }
+
+  /** Shadow darkness, as Babylon's ShadowGenerator.setDarkness: 0 = black, 1 = invisible. */
+  setDarkness(darkness: number): void {
+    this.core.tuning.darkness = darkness;
+  }
+
+  /** Change the world bounds of everything that casts or receives, and re-render. */
+  setSceneBounds(min: Vec3, max: Vec3): void {
+    this.core.setSceneBounds(min, max);
   }
 
   /** Upload content and start running every frame. */
@@ -452,6 +489,11 @@ export class SundialBabylon {
     this.core.build();
     this.observer = this.scene.onBeforeRenderObservable.add(() => this.update());
     this.afterCameraObserver = this.scene.onAfterCameraRenderObservable.add((camera) => this.captureDepth(camera));
+    // A plugin must attach when its material is constructed, as Babylon's own
+    // RegisterMaterialPlugin does, so content streamed in later receives too.
+    this.newMaterialObserver = this.scene.onNewMaterialAddedObservable.add((m) => {
+      if (this.receiveNewMaterials(m)) this.addReceivers([m]);
+    });
   }
 
   setEnabled(on: boolean): void {
@@ -468,7 +510,8 @@ export class SundialBabylon {
   dispose(): void {
     this.observer?.remove();
     this.afterCameraObserver?.remove();
-    this.observer = this.afterCameraObserver = null;
+    this.newMaterialObserver?.remove();
+    this.observer = this.afterCameraObserver = this.newMaterialObserver = null;
     this.disposed = true;
     this.setEnabled(false);
     this.running = false;

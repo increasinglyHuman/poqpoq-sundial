@@ -15,7 +15,7 @@ import {
   type WorkLayout,
 } from "./kernels";
 import { rasterWGSL } from "./raster";
-import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, PARAMS_BYTES, PARAMS_HEADER_BYTES } from "./wgsl";
+import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, PARAMS_BYTES, PARAMS_HEADER_BYTES, SHADE_WORD } from "./wgsl";
 
 // Sundial: a paged, cached shadow clipmap for one directional light.
 //
@@ -83,6 +83,12 @@ export interface Tuning {
   /** Sun-angle tolerance of level 0 in degrees; level k tolerates 2^k times more. */
   bandDegrees: number;
   renderBudget: number;
+  /**
+   * Light left in full shadow: 0 = black, 1 = no visible shadow. Same meaning
+   * as Babylon's ShadowGenerator.setDarkness, so a host can feed it the value
+   * it already computes (fill, dusk fade).
+   */
+  darkness: number;
 }
 
 export interface Stats {
@@ -157,6 +163,7 @@ export class PagedShadowCore {
     debugMode: 0,
     bandDegrees: 0.05,
     renderBudget: 96,
+    darkness: 0,
   };
 
   /** Resources receivers bind (params, page table, pool). */
@@ -171,8 +178,8 @@ export class PagedShadowCore {
     levelRefreshes: 0, lastRefreshedLevel: -1,
   };
 
-  private readonly sceneMin: Vec3;
-  private readonly sceneMax: Vec3;
+  private sceneMin: Vec3;
+  private sceneMax: Vec3;
   private readonly renderBudgetMax: number;
   private readonly slots: number;
   private readonly work: WorkLayout;
@@ -379,6 +386,16 @@ export class PagedShadowCore {
 
   invalidateAll(): void {
     for (const lv of this.levels) lv.invalidate = true;
+  }
+
+  /**
+   * Change the world bounds of everything that casts or receives (a region
+   * or sim change). Every level is re-fitted and re-rendered.
+   */
+  setSceneBounds(min: Vec3, max: Vec3): void {
+    this.sceneMin = [...min];
+    this.sceneMax = [...max];
+    this.invalidateAll();
   }
 
   /**
@@ -738,6 +755,7 @@ export class PagedShadowCore {
     } else {
       f.set([0, 0, this.markStride, 0], 36);
     }
+    f.set([Math.min(1, Math.max(0, t.darkness)), 0, 0, 0], SHADE_WORD);
 
     const corners: Vec3[] = [];
     for (let k = 0; k < 8; k++) {

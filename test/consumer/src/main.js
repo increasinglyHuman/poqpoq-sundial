@@ -47,7 +47,33 @@ try {
     const gpuErrors = (r.gpuErrors = []);
     engine._device.addEventListener("uncapturederror", (e) => gpuErrors.push(String(e.error?.message ?? e)));
     // Rebuild while frames are in flight: every geometry should come from the cache.
-    setTimeout(() => { sd.setCasters([ground, box, { mesh: prim }, leaf]); r.rebuild = sd.core.contentSummary; }, 1200);
+    const frames = (n) => new Promise((done) => { let k = 0; const o = scene.onAfterRenderObservable.add(() => { if (++k >= n) { o.remove(); done(); } }); });
+    const meanLuma = async () => {
+      const w = engine.getRenderWidth(), h = engine.getRenderHeight();
+      const px = await engine.readPixels(0, 0, w, h);
+      let sum = 0; for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
+      return sum / (px.length / 4) / 3;
+    };
+    (async () => {
+      await new Promise((done) => setTimeout(done, 1200)); // the leaf's mask is in by now
+      // Rebuild while frames are in flight: every geometry should come from the cache.
+      sd.setCasters([ground, box, { mesh: prim }, leaf]); r.rebuild = sd.core.contentSummary;
+      // New bounds re-fit and re-render every level; the checks below run on the result.
+      sd.setSceneBounds([-30, -1, -30], [30, 12, 30]);
+      await frames(30);
+      // Darkness 1 leaves no visible shadow, so the frame gets brighter.
+      r.lumaDark0 = await meanLuma();
+      sd.setDarkness(1); await frames(5);
+      r.lumaDark1 = await meanLuma();
+      sd.setDarkness(0);
+      // A material created after start() receives without being registered.
+      const late = new StandardMaterial("late", scene);
+      const lateGround = MeshBuilder.CreateGround("lg", { width: 6, height: 6 }, scene); lateGround.position.set(0, 0.01, 8);
+      lateGround.material = late; lateGround.receiveShadows = true;
+      await frames(10);
+      r.late = { plugin: !!late.pluginManager?.getPlugin("Sundial"), enabled: !!lateGround.subMeshes[0].materialDefines?.PSENABLED };
+      r.done = true;
+    })().catch((e) => { r.error = String(e); r.done = true; });
   }
   engine.runRenderLoop(() => scene.render());
   await scene.whenReadyAsync();

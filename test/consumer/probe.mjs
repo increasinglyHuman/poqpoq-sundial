@@ -17,7 +17,8 @@ for (const engine of ["webgl2", "webgpu"]) {
   const errs = []; p.on("pageerror", (e) => errs.push(e.message)); p.on("console", (m) => { if (m.type() === "error" && !/404/.test(m.text())) errs.push(m.text().slice(0, 160)); });
   await p.goto(`http://localhost:5189/?engine=${engine}`);
   await p.waitForFunction(() => window.__ready === true, null, { timeout: 60000 });
-  await p.waitForTimeout(2500);
+  await p.waitForFunction(() => window.__result.done || !window.__result.supported || window.__result.error, null, { timeout: 30000 });
+  await p.waitForTimeout(500);
   const res = await p.evaluate(() => { const r = window.__result; return { ...r, core: r.core ? (({ requestedPages, residentPages, allocationFailures, alphaPairs, opaquePairs }) => ({ requestedPages, residentPages, allocationFailures, alphaPairs, opaquePairs }))(r.core()) : undefined }; });
     const ok = res.imported && !res.error && errs.length === 0 &&
     (engine === "webgl2" ? res.supported === false : res.supported === true && res.core.requestedPages > 0 && res.core.allocationFailures === 0 &&
@@ -27,7 +28,11 @@ for (const engine of ["webgl2", "webgpu"]) {
       // readCoverage keeps texture-memory order: only the top-left quadrant is opaque
       res.orientation.topLeft === 255 && res.orientation.topRight === 0 && res.orientation.bottomLeft === 0 &&
       // the leaf's mask was read and it now casts through the alpha pipeline
-      res.firstBuild.alphaClusters === 0 && res.rebuild.alphaClusters === 1);
+      res.firstBuild.alphaClusters === 0 && res.rebuild.alphaClusters === 1 &&
+      // darkness 1 hides every shadow: the whole frame gets measurably brighter
+      res.lumaDark1 > res.lumaDark0 + 1 &&
+      // a material made after start() picked up the receiver on its own
+      res.late.plugin && res.late.enabled);
   failed ||= !ok;
   console.log(ok ? "PASS" : "FAIL", engine, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "");
   await p.close();
