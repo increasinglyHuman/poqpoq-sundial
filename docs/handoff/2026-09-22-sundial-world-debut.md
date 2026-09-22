@@ -30,17 +30,16 @@ order.
     - two scenes, each with an atmosphere
     - materials created before and after the second atmosphere
     - disposal in either order
-- **Prepass PR: not opened yet.** It's on fork branch `fix/standard-depthprepass-alphatest` in
-  `C:/Users/incre/blackbox/Babylon.js`, with two commits:
-  - `b39f460`: the shared alpha block evaluated before the prepass exits.
+- **Prepass PR: opened as BabylonJS/Babylon.js#18936** (2026-09-22). Three commits on fork branch
+  `fix/standard-depthprepass-alphatest`:
+  - `b39f460`: the shared alpha block, evaluated before the prepass exits.
   - `0800c3b`: bind `alphaCutOff` whenever ALPHATEST is defined. This fixes a second bug, where
     vertex and instance alpha, opacity Fresnel and `material.alpha` never discarded.
-- Still uncommitted on that branch:
-  - the `config.json` test entry (Playground `#7EDYVC#3`)
-  - `ReferenceImages/needDepthPrePassStandardAlphaTest.png`, regenerated from a verified fresh UMD
-    bundle. Look at it before committing: the left half of the vertex-alpha quad must be cut away.
-- A patched-vs-master visual A/B was running at handoff. Read `%TEMP%/ab-babylon.log` or re-run
-  `%TEMP%/ab-babylon.sh`, then commit, push, and open the PR. Cite forum thread 64133 and the A/B.
+  - `819ac00`: a visual test on Playground `#7EDYVC#3`. It fails on master and passes with the fix,
+    on WebGL2 and WebGPU.
+- The full-suite A/B against master found no regressions. Candidates were re-run 3× with retries
+  off; each either passed consistently or failed identically on master.
+- Next: respond to review.
 
 **World:** nothing of Sundial yet.
 - Merged: #1959 face grouping (flag OFF), #1988 leaf prepass (OFF), and #1979.
