@@ -34,6 +34,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.lumaDark1 > res.lumaDark0 + 0.1 &&
       // a material made after start() picked up the receiver on its own
       res.late.plugin && res.late.enabled &&
+      // requests are per frame: empty sky requests fewer pages than the ground, and they come back
+      res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
       // after dispose, a second instance took over the same materials and is paging
       res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1 &&
       // a second (Babylon) shadow on the same caster does not darken the overlap twice

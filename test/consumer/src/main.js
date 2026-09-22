@@ -118,6 +118,16 @@ try {
       lateGround.material = late; lateGround.receiveShadows = true;
       await frames(10);
       r.late = { plugin: !!late.pluginManager?.getPlugin("Sundial"), enabled: !!lateGround.subMeshes[0].materialDefines?.PSENABLED };
+      // Requests are per frame (review F1, PR #9): look at empty sky and the pages the ground asked
+      // for must stop being requested. If the request buffer were never cleared they would stay.
+      r.requestedGround = sd.core.stats.requestedPages;
+      const target = cam.getTarget().clone();
+      cam.setTarget(cam.position.add(new Vector3(0, 1, 0.01)));
+      await frames(20);
+      r.requestedSky = sd.core.stats.requestedPages;
+      cam.setTarget(target);
+      await frames(20);
+      r.requestedBack = sd.core.stats.requestedPages;
       // A host rebuilds its backend (World re-applies on camera swaps and vetoes): dispose, then a
       // new instance on the same scene must take over the materials' existing receivers.
       sd.dispose();
