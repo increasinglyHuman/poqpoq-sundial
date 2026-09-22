@@ -2,7 +2,7 @@ import "@babylonjs/core";
 // Loaded up front: the shadow generator imports these lazily, which this harness's Vite cannot serve.
 import "@babylonjs/core/ShadersWGSL/shadowMap.fragment.js";
 import "@babylonjs/core/ShadersWGSL/shadowMap.vertex.js";
-import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, ShadowGenerator, Vector3, Color3 } from "@babylonjs/core";
+import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, Matrix, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, ShadowGenerator, Vector3, Color3 } from "@babylonjs/core";
 import { SundialBabylon, readCoverage } from "@poqpoq/sundial/babylon";
 const r = (window.__result = { imported: true });
 try {
@@ -118,6 +118,24 @@ try {
       lateGround.material = late; lateGround.receiveShadows = true;
       await frames(10);
       r.late = { plugin: !!late.pluginManager?.getPlugin("Sundial"), enabled: !!lateGround.subMeshes[0].materialDefines?.PSENABLED };
+      // A thin host whose live buffer is a VIEW (World's distance culling zero-scales far members):
+      // registered with its real transforms via instanceMatrices, the hidden member still casts.
+      {
+        const pillars = MeshBuilder.CreateBox("pillars", { width: 1, height: 6, depth: 1 }, scene);
+        const canon = new Float32Array(32);
+        Matrix.Translation(-12, 3, 6).copyToArray(canon, 0);
+        Matrix.Translation(12, 3, 6).copyToArray(canon, 16);
+        const live = canon.slice();
+        Matrix.Scaling(0, 0, 0).multiply(Matrix.Translation(12, 3, 6)).copyToArray(live, 16); // "culled"
+        pillars.thinInstanceSetBuffer("matrix", live, 16, true);
+        pillars.receiveShadows = true;
+        const base = [ground, box, { mesh: prim }, leaf];
+        sd.setCasters([...base, pillars]); await frames(30);
+        r.instanceLive = await meanLuma();
+        sd.setCasters([...base, { mesh: pillars, options: { instanceMatrices: canon } }]); await frames(30);
+        r.instanceCanon = await meanLuma();
+        sd.setCasters(base); pillars.dispose(); await frames(10);
+      }
       // Requests are per frame (review F1, PR #9): look at empty sky and the pages the ground asked
       // for must stop being requested. If the request buffer were never cleared they would stay.
       r.requestedGround = sd.core.stats.requestedPages;

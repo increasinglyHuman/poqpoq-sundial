@@ -84,6 +84,16 @@ export interface CasterOptions {
    * at registration. Instances beyond it do not cast (warned once).
    */
   capacity?: number;
+  /**
+   * Static thin-instanced casters: the instances' own transforms (16 floats
+   * each, instance-local, the thin-instance buffer's layout), used instead of
+   * the buffer Babylon renders from. For hosts whose buffer is a VIEW of the
+   * content rather than the content itself: World's distance culling hides a
+   * far member by writing a zero-scale matrix into its slot, and a caster read
+   * from that buffer would never cast once registered, however close the
+   * camera came. Ignored for dynamic casters, which follow the live buffer.
+   */
+  instanceMatrices?: Float32Array;
 }
 
 /** Where an alpha-tested material's coverage comes from. */
@@ -288,11 +298,13 @@ function cameraDepth(camera: Camera, scene: Scene): GPUTexture | null {
   return texture && texture.usage & GPUTextureUsage.TEXTURE_BINDING ? texture : null;
 }
 
-function casterMatrices(mesh: Mesh, out?: Float32Array): Float32Array {
+function casterMatrices(mesh: Mesh, out?: Float32Array, instances?: Float32Array): Float32Array {
   const world = mesh.computeWorldMatrix(true);
-  const count = mesh.thinInstanceCount;
-  const data = (mesh as unknown as { _thinInstanceDataStorage?: { matrixData?: Float32Array | null } })
-    ._thinInstanceDataStorage?.matrixData;
+  const count = instances ? instances.length / 16 : mesh.thinInstanceCount;
+  const data =
+    instances ??
+    (mesh as unknown as { _thinInstanceDataStorage?: { matrixData?: Float32Array | null } })._thinInstanceDataStorage
+      ?.matrixData;
   if (count > 0 && data) {
     const result = out && out.length === count * 16 ? out : new Float32Array(count * 16);
     const local = new Matrix();
@@ -413,7 +425,7 @@ export class SundialBabylon {
     if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
     const explicit = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
     const scope = `${mesh.geometry?.uniqueId ?? `mesh${mesh.uniqueId}`}:${contentHash(positions)}`;
-    let matrices = casterMatrices(mesh);
+    let matrices = casterMatrices(mesh, undefined, opts.dynamic ? undefined : opts.instanceMatrices);
     if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
       // Reserved slots start as zero matrices, which cast nothing.
       const padded = new Float32Array(opts.capacity * 16);
