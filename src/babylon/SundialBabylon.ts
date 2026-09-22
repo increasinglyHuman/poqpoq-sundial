@@ -17,6 +17,7 @@ import { BaseTexture } from "@babylonjs/core/Materials/Textures/baseTexture";
 import { VertexBuffer } from "@babylonjs/core/Buffers/buffer";
 import { Matrix } from "@babylonjs/core/Maths/math.vector";
 import { WebGPUDataBuffer } from "@babylonjs/core/Meshes/WebGPU/webgpuDataBuffer";
+import { GetTextureDataAsync } from "@babylonjs/core/Misc/textureTools";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions } from "../core/PagedShadowCore";
 import { COMMON_WGSL, RECEIVER_WGSL } from "../core/wgsl";
 
@@ -62,15 +63,94 @@ function storage(buffer: GPUBuffer): StorageLike {
 export interface CasterOptions {
   /** Re-read the world matrix every frame and invalidate what it moved over. */
   dynamic?: boolean;
-  /** Alpha-tested caster: layer registered with `setAlphaMask`. */
+  /**
+   * Alpha-tested caster with a mask you supply: the layer registered with
+   * `setAlphaMask`. Overrides the automatic mask. Use low layer numbers;
+   * automatic masks are allocated from the top layer down.
+   */
   alphaLayer?: number;
   alphaCutoff?: number;
+  /**
+   * Read alpha masks from the materials' own textures (default true), with
+   * the same rule as Babylon's ShadowGenerator: an alpha-tested material casts
+   * through its alpha-test texture's alpha at its alphaCutOff. Until the mask
+   * has been read the caster casts opaque; then it rebuilds.
+   */
+  autoAlpha?: boolean;
   /**
    * Dynamic thin-instanced casters: instance slots to reserve, so the
    * thin-instance count can grow up to this at runtime. Defaults to the count
    * at registration. Instances beyond it do not cast (warned once).
    */
   capacity?: number;
+}
+
+/** Where an alpha-tested material's coverage comes from. */
+interface AlphaSource {
+  texture: BaseTexture;
+  cutoff: number;
+}
+
+interface AlphaLayer {
+  layer: number;
+  cutoff: number;
+  state: "loading" | "ready" | "failed";
+}
+
+type TextureLike = BaseTexture & { getTextureMatrix?: () => Matrix };
+
+/**
+ * The texture an alpha-tested caster discards against, chosen exactly as
+ * Babylon's ShadowGenerator chooses it, so Sundial's shadows cut out wherever
+ * CSM's do: when the material alpha-tests for this mesh, its alpha-test
+ * texture (diffuse for Standard, albedo for PBR), its alpha channel, at
+ * alphaCutOff (default 0.5). Null when there is no such texture: the caster
+ * casts opaque, as it does under CSM.
+ */
+function alphaSource(material: Material | null, mesh: Mesh): AlphaSource | null {
+  if (!material) return null;
+  const m = material as Material & { alphaCutOff?: number };
+  if (!(m.needAlphaTestingForMesh?.(mesh) ?? m.needAlphaTesting())) return null;
+  const texture = m.getAlphaTestTexture?.() as BaseTexture | null;
+  if (!texture) return null;
+  return { texture, cutoff: m.alphaCutOff ?? 0.5 };
+}
+
+/**
+ * The UVs a caster's alpha texture is sampled with, with its texture matrix
+ * (scale, offset, rotation) applied the way Babylon's vertex shaders apply it:
+ * uv' = (M * vec4(uv, 1, 0)).xy.
+ */
+function textureUVs(mesh: Mesh, texture: TextureLike): Float32Array | null {
+  // As ShadowGenerator: the second UV set when the texture asks for it, else the first.
+  const second = texture.coordinatesIndex === 1 && mesh.isVerticesDataPresent(VertexBuffer.UV2Kind);
+  const data = mesh.getVerticesData(second ? VertexBuffer.UV2Kind : VertexBuffer.UVKind);
+  if (!data) return null;
+  const uvs = new Float32Array(data);
+  const matrix = texture.getTextureMatrix?.();
+  if (matrix && !matrix.isIdentity()) {
+    const m = matrix.m;
+    for (let i = 0; i < uvs.length; i += 2) {
+      const u = uvs[i];
+      const v = uvs[i + 1];
+      uvs[i] = m[0] * u + m[4] * v + m[8];
+      uvs[i + 1] = m[1] * u + m[5] * v + m[9];
+    }
+  }
+  return uvs;
+}
+
+/**
+ * A texture as RGBA8 at `size`², rows in texture-memory order (the order the
+ * shader samples in). Goes through a render target, which also decodes
+ * compressed (KTX2) textures and resizes.
+ * @internal exported for the consumer test
+ */
+export async function readCoverage(texture: BaseTexture, size: number): Promise<Uint8ClampedArray<ArrayBuffer>> {
+  const data = await GetTextureDataAsync(texture, size, size, 0, 0, true);
+  const px = new Uint8ClampedArray(size * size * 4);
+  px.set(new Uint8Array(data.buffer, data.byteOffset, px.length));
+  return px;
 }
 
 /** A caster for setCasters(): a mesh, or a mesh with its options. */
@@ -200,6 +280,11 @@ export class SundialBabylon {
   /** @internal */ readonly pageTable: StorageLike;
 
   private readonly dynamics: DynamicCaster[] = [];
+  private entries: { mesh: Mesh; options?: CasterOptions }[] = [];
+  private rebuildPending = false;
+  private readonly alphaLayers = new Map<string, AlphaLayer>();
+  private warnedAlphaLayers = false;
+  private disposed = false;
   private readonly plugins: SundialPlugin[] = [];
   private observer: Observer<Scene> | null = null;
   private running = false;
@@ -232,7 +317,7 @@ export class SundialBabylon {
     const engine = scene.getEngine() as WebGPUEngine;
     if (!engine.isWebGPU) throw new Error("Sundial needs the WebGPU engine");
     makeMainDepthReadable(engine);
-    this.core = new PagedShadowCore(engine._device, options);
+    this.core = new PagedShadowCore(engine._device, { maxAlphaLayers: 16, ...options });
 
     const internal = engine.wrapWebGPUTexture(this.core.poolTexture);
     (internal._hardwareTexture as unknown as { createView(d: GPUTextureViewDescriptor): void }).createView({
@@ -248,31 +333,13 @@ export class SundialBabylon {
    * Register a mesh (and all of its thin instances) as a shadow caster, one
    * group per material it draws with. SubMeshes whose MultiMaterial slot is
    * null (hidden faces) do not cast. Clustering is cached by geometry and
-   * content, so registering the same content again is cheap.
+   * content, so registering the same content again is cheap. After start()
+   * the caster is built in at the next frame.
    */
   addCaster(mesh: Mesh, opts: CasterOptions = {}): InstanceGroup[] {
-    const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
-    const indices = mesh.getIndices();
-    if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
-    const alpha = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
-    const uvs = alpha ? mesh.getVerticesData(VertexBuffer.UVKind) : null;
-    const scope = `${mesh.geometry?.uniqueId ?? `mesh${mesh.uniqueId}`}:${contentHash(positions, uvs ?? [])}`;
-    let matrices = casterMatrices(mesh);
-    if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
-      // Reserved slots start as zero matrices, which cast nothing.
-      const padded = new Float32Array(opts.capacity * 16);
-      padded.set(matrices);
-      matrices = padded;
-    }
-    const groups: InstanceGroup[] = [];
-    for (const run of castingRuns(mesh, indices).values()) {
-      if (run.length < 3) continue;
-      const key = `${scope}:${contentHash(run)}:${alpha ? `${alpha.layer}/${alpha.cutoff}` : "opaque"}`;
-      const geometry = this.core.addGeometry({ ...compact(run, positions, uvs), alpha }, key);
-      groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
-    }
-    if (opts.dynamic && groups.length) this.dynamics.push({ mesh, groups, last: matrices.slice() });
-    return groups;
+    this.entries.push({ mesh, options: opts });
+    if (this.running) this.rebuildPending = true;
+    return this.register(mesh, opts);
   }
 
   /**
@@ -282,11 +349,89 @@ export class SundialBabylon {
    * re-renders every cached page). Returns each entry's groups, in order.
    */
   setCasters(entries: CasterEntry[]): InstanceGroup[][] {
+    this.entries = entries.map((e) => ("getClassName" in e ? { mesh: e } : e));
+    return this.rebuild();
+  }
+
+  private rebuild(): InstanceGroup[][] {
+    this.rebuildPending = false;
     this.dynamics.length = 0;
     this.core.clearContent();
-    const groups = entries.map((e) => ("getClassName" in e ? this.addCaster(e) : this.addCaster(e.mesh, e.options)));
+    const groups = this.entries.map((e) => this.register(e.mesh, e.options ?? {}));
     if (this.running) this.core.build();
     return groups;
+  }
+
+  private register(mesh: Mesh, opts: CasterOptions): InstanceGroup[] {
+    const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
+    const indices = mesh.getIndices();
+    if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
+    const explicit = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
+    const scope = `${mesh.geometry?.uniqueId ?? `mesh${mesh.uniqueId}`}:${contentHash(positions)}`;
+    let matrices = casterMatrices(mesh);
+    if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
+      // Reserved slots start as zero matrices, which cast nothing.
+      const padded = new Float32Array(opts.capacity * 16);
+      padded.set(matrices);
+      matrices = padded;
+    }
+    const groups: InstanceGroup[] = [];
+    for (const [material, run] of castingRuns(mesh, indices)) {
+      if (run.length < 3) continue;
+      let alpha = explicit;
+      let uvs: Float32Array | null = null;
+      if (explicit) {
+        const data = mesh.getVerticesData(VertexBuffer.UVKind);
+        uvs = data ? new Float32Array(data) : null;
+      } else if (opts.autoAlpha !== false) {
+        const source = alphaSource(material, mesh);
+        uvs = source ? textureUVs(mesh, source.texture) : null;
+        alpha = source && uvs ? this.alphaLayerFor(source) : undefined;
+      }
+      if (!alpha) uvs = null;
+      const key = `${scope}:${contentHash(run)}:${alpha ? `${alpha.layer}/${alpha.cutoff}:${contentHash(uvs!)}` : "opaque"}`;
+      const geometry = this.core.addGeometry({ ...compact(run, positions, uvs), alpha }, key);
+      groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
+    }
+    if (opts.dynamic && groups.length) this.dynamics.push({ mesh, groups, last: matrices.slice() });
+    return groups;
+  }
+
+  /**
+   * The alpha layer holding this source's coverage, or undefined while it is
+   * still being read (or could not be): the caster casts opaque meanwhile,
+   * and a rebuild follows once the mask is in. Layers are shared by texture,
+   * and cutoff, and allocated from the top layer down.
+   */
+  private alphaLayerFor(source: AlphaSource): { layer: number; cutoff: number } | undefined {
+    const key = `${source.texture.uniqueId}:${source.cutoff}`;
+    let entry = this.alphaLayers.get(key);
+    if (!entry) {
+      const layer = this.core.alphaLayerCount - 1 - this.alphaLayers.size;
+      if (layer < 0) {
+        if (!this.warnedAlphaLayers) console.warn(`Sundial: out of alpha layers (${this.core.alphaLayerCount}); further alpha-tested casters cast opaque. Raise maxAlphaLayers.`);
+        this.warnedAlphaLayers = true;
+        return undefined;
+      }
+      entry = { layer, cutoff: source.cutoff, state: "loading" };
+      this.alphaLayers.set(key, entry);
+      const loaded = entry;
+      readCoverage(source.texture, this.core.alphaSize)
+        .then((px) => {
+          if (this.disposed) return;
+          const size = this.core.alphaSize;
+          const canvas = new OffscreenCanvas(size, size);
+          canvas.getContext("2d")!.putImageData(new ImageData(px, size, size), 0, 0);
+          this.core.setAlphaLayer(loaded.layer, canvas, loaded.cutoff);
+          loaded.state = "ready";
+          this.rebuildPending = true;
+        })
+        .catch((e) => {
+          loaded.state = "failed";
+          console.warn(`Sundial: could not read alpha mask from ${source.texture.name}; its casters cast opaque.`, e);
+        });
+    }
+    return entry.state === "ready" ? { layer: entry.layer, cutoff: entry.cutoff } : undefined;
   }
 
   setAlphaMask(layer: number, source: HTMLCanvasElement | OffscreenCanvas | ImageBitmap, cutoff = 0.5): void {
@@ -324,6 +469,7 @@ export class SundialBabylon {
     this.observer?.remove();
     this.afterCameraObserver?.remove();
     this.observer = this.afterCameraObserver = null;
+    this.disposed = true;
     this.setEnabled(false);
     this.running = false;
     this.dynamics.length = 0;
@@ -361,6 +507,7 @@ export class SundialBabylon {
 
   private update(): void {
     if (!this.enabled) return;
+    if (this.rebuildPending) this.rebuild();
     this.updateDynamics();
     const camera = this.getCamera();
     if (!camera) return;

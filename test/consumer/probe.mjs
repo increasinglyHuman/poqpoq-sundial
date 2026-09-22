@@ -18,12 +18,16 @@ for (const engine of ["webgl2", "webgpu"]) {
   await p.goto(`http://localhost:5189/?engine=${engine}`);
   await p.waitForFunction(() => window.__ready === true, null, { timeout: 60000 });
   await p.waitForTimeout(2500);
-  const res = await p.evaluate(() => { const r = window.__result; return { ...r, core: r.core ? (({ requestedPages, residentPages, allocationFailures }) => ({ requestedPages, residentPages, allocationFailures }))(r.core()) : undefined }; });
+  const res = await p.evaluate(() => { const r = window.__result; return { ...r, core: r.core ? (({ requestedPages, residentPages, allocationFailures, alphaPairs, opaquePairs }) => ({ requestedPages, residentPages, allocationFailures, alphaPairs, opaquePairs }))(r.core()) : undefined }; });
     const ok = res.imported && !res.error && errs.length === 0 &&
     (engine === "webgl2" ? res.supported === false : res.supported === true && res.core.requestedPages > 0 && res.core.allocationFailures === 0 &&
-      // ground 32 + box 12 + the prim's 6 visible triangles (its hidden half must not cast)
-      res.firstBuild.triangles === 50 && res.firstBuild.geometries === 3 &&
-      res.rebuild?.cachedGeometries === 3 && res.rebuild.triangles === 50 && res.gpuErrors.length === 0);
+      // ground 32 + box 12 + the prim's 6 visible triangles (its hidden half must not cast) + leaf 2
+      res.firstBuild.triangles === 52 && res.firstBuild.geometries === 4 &&
+      res.rebuild?.cachedGeometries === 4 && res.rebuild.triangles === 52 && res.gpuErrors.length === 0 &&
+      // readCoverage keeps texture-memory order: only the top-left quadrant is opaque
+      res.orientation.topLeft === 255 && res.orientation.topRight === 0 && res.orientation.bottomLeft === 0 &&
+      // the leaf's mask was read and it now casts through the alpha pipeline
+      res.firstBuild.alphaClusters === 0 && res.rebuild.alphaClusters === 1);
   failed ||= !ok;
   console.log(ok ? "PASS" : "FAIL", engine, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "");
   await p.close();

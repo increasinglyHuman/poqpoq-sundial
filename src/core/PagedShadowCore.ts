@@ -180,7 +180,9 @@ export class PagedShadowCore {
   private readonly counterBuffer: GPUBuffer;
   private readonly pairBuffer: GPUBuffer;
   private readonly alphaTexture: GPUTexture;
-  private readonly alphaSize: number;
+  /** Texels per side of each alpha layer. */
+  readonly alphaSize: number;
+  readonly alphaLayerCount: number;
   private readonly alphaSampler: GPUSampler;
   private readonly params = new ArrayBuffer(PARAMS_BYTES);
   private readonly levels: LevelState[] = [];
@@ -260,7 +262,7 @@ export class PagedShadowCore {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.alphaSize = options.alphaTextureSize ?? 256;
-    const alphaLayers = options.maxAlphaLayers ?? 4;
+    const alphaLayers = (this.alphaLayerCount = options.maxAlphaLayers ?? 4);
     this.alphaTexture = device.createTexture({
       label: "ps.alpha",
       size: [this.alphaSize, this.alphaSize, alphaLayers],
@@ -539,6 +541,8 @@ export class PagedShadowCore {
       /** Geometries registered since clearContent() that reused cached clusters. */
       cachedGeometries: this.cacheHits,
       geometries: this.geometries.length,
+      /** Clusters that cast through an alpha mask. */
+      alphaClusters: this.geometries.reduce((s, g) => s + g.clusters.filter((c) => c.alphaLayer !== 0xffffffff).length, 0),
       instances: this.instanceGeometry.length,
       clusters: this.clusterCount,
       clusterInstances: this.clusterInstanceCount,
