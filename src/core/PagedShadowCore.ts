@@ -146,6 +146,17 @@ const COPY_SRC = 0x0004;
 /** Builds an unused geometry stays cached for: content back within this many rebuilds is not re-clustered. */
 const CACHE_GRACE_BUILDS = 4;
 
+/** Darkness at or above which shadows are invisible: receivers skip the lookup and the core stops working. Mirrored in RECEIVER_WGSL. */
+export const INVISIBLE_DARKNESS = 0.999;
+
+/** The depth range covers the scene's bounding sphere times this (plus 16 m), so growing content rarely escapes it. */
+const DEPTH_HEADROOM = 1.25;
+
+function boundingSphere(min: Vec3, max: Vec3): [Vec3, number] {
+  const c: Vec3 = [(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2];
+  return [c, Math.hypot(max[0] - c[0], max[1] - c[1], max[2] - c[2])];
+}
+
 export class PagedShadowCore {
   readonly device: GPUDevice;
   readonly levelCount: number;
@@ -183,6 +194,14 @@ export class PagedShadowCore {
 
   private sceneMin: Vec3;
   private sceneMax: Vec3;
+  /**
+   * The sphere every level's depth range is fitted to: the scene bounds with
+   * headroom, so content streaming in (which grows the bounds a little at a
+   * time) does not re-render every page. 32-bit depth over the padded range
+   * still resolves far below a texel.
+   */
+  private depthCentre: Vec3 = [0, 0, 0];
+  private depthRadius = 0;
   private readonly renderBudgetMax: number;
   private readonly slots: number;
   private readonly work: WorkLayout;
@@ -233,6 +252,8 @@ export class PagedShadowCore {
   private previousInstances: Map<string, [Vec3, Vec3][]> | null = null;
   /** What the last build() did, for hosts to report. */
   lastBuild = { reusedGeometry: false, invalidated: "all" as "all" | number };
+  /** True while shadows are fully faded and update() is skipping all GPU work. */
+  dormant = false;
   private groups: InstanceGroup[] = [];
   private instanceMatrices: number[] = []; // 12 floats (3 affine rows) per instance
   private instanceGeometry: number[] = [];
@@ -270,6 +291,7 @@ export class PagedShadowCore {
     this.device = device;
     this.sceneMin = options.sceneMin;
     this.sceneMax = options.sceneMax;
+    this.fitDepth();
     this.levelCount = Math.min(MAX_LEVELS, options.levels ?? 7);
     this.pagesPerSide = options.pagesPerSide ?? 16;
     this.pageSize = options.pageSize ?? 128;
@@ -412,17 +434,47 @@ export class PagedShadowCore {
     const rows = affineRows(matrix, 0);
     for (let k = 0; k < 12; k++) this.instanceMatrices[inst * 12 + k] = rows[k];
     const after = this.instanceBounds(inst);
-    this.invalidateBox(
-      [Math.min(before[0][0], after[0][0]), Math.min(before[0][1], after[0][1]), Math.min(before[0][2], after[0][2])],
-      [Math.max(before[1][0], after[1][0]), Math.max(before[1][1], after[1][1]), Math.max(before[1][2], after[1][2])],
-    );
+    // A collapsed (zero-scale) instance casts nothing and has no footprint. Its
+    // translation is meaningless (usually the origin), so it must not stretch
+    // the box: an instance going away or coming back re-renders only where it
+    // was or will be, not everything between it and the world origin.
+    const box = before && after
+      ? ([
+          [Math.min(before[0][0], after[0][0]), Math.min(before[0][1], after[0][1]), Math.min(before[0][2], after[0][2])],
+          [Math.max(before[1][0], after[1][0]), Math.max(before[1][1], after[1][1]), Math.max(before[1][2], after[1][2])],
+        ] as [Vec3, Vec3])
+      : (before ?? after);
+    if (box) this.invalidateBox(box[0], box[1]);
     this.dirtyInstances.add(inst);
   }
 
   /** Re-render every cached page whose light-space footprint meets this world box. */
   invalidateBox(min: Vec3, max: Vec3): void {
-    if (this.regions.length / 8 >= MAX_REGIONS) {
-      this.invalidateAll();
+    const n = this.regions.length / 8;
+    if (n >= MAX_REGIONS) {
+      // Full: grow the queued box this one enlarges least, instead of
+      // re-rendering every page. Many movers in one frame are usually close
+      // together (a linkset, a vehicle), so the merged boxes stay local.
+      const r = this.regions;
+      let best = 0;
+      let bestGrowth = Infinity;
+      for (let i = 0; i < n; i++) {
+        const o = i * 8;
+        // Sum of extents, not volume: flat boxes (a floor, a wall) have none.
+        const before = r[o + 4] - r[o] + (r[o + 5] - r[o + 1]) + (r[o + 6] - r[o + 2]);
+        const after =
+          Math.max(r[o + 4], max[0]) - Math.min(r[o], min[0]) +
+          (Math.max(r[o + 5], max[1]) - Math.min(r[o + 1], min[1])) +
+          (Math.max(r[o + 6], max[2]) - Math.min(r[o + 2], min[2]));
+        if (after - before < bestGrowth) {
+          bestGrowth = after - before;
+          best = o;
+        }
+      }
+      for (let k = 0; k < 3; k++) {
+        r[best + k] = Math.min(r[best + k], min[k]);
+        r[best + 4 + k] = Math.max(r[best + 4 + k], max[k]);
+      }
       return;
     }
     this.regions.push(min[0], min[1], min[2], 0, max[0], max[1], max[2], 0);
@@ -439,7 +491,21 @@ export class PagedShadowCore {
   setSceneBounds(min: Vec3, max: Vec3): void {
     this.sceneMin = [...min];
     this.sceneMax = [...max];
-    this.invalidateAll();
+    // The coarsest level's resident rect follows the bounds every frame on its
+    // own. Only content escaping the depth range needs new bases, and those
+    // re-render everything.
+    const [c, r] = boundingSphere(this.sceneMin, this.sceneMax);
+    const d = Math.hypot(c[0] - this.depthCentre[0], c[1] - this.depthCentre[1], c[2] - this.depthCentre[2]);
+    if (d + r > this.depthRadius) {
+      this.fitDepth();
+      this.invalidateAll();
+    }
+  }
+
+  private fitDepth(): void {
+    const [c, r] = boundingSphere(this.sceneMin, this.sceneMax);
+    this.depthCentre = c;
+    this.depthRadius = r * DEPTH_HEADROOM + 16;
   }
 
   /**
@@ -632,11 +698,13 @@ export class PagedShadowCore {
     const out = new Map<string, [Vec3, Vec3][]>();
     const m = this.instanceMatrices;
     for (let inst = 0; inst < this.instanceGeometry.length; inst++) {
+      const bounds = this.instanceBounds(inst);
+      if (!bounds) continue; // collapsed: casts nothing, so neither its going nor its coming changes a page
       const o = inst * 12;
       const sig = `${this.geometryKeyOrder[this.instanceGeometry[inst]]}|${m[o]},${m[o + 1]},${m[o + 2]},${m[o + 3]},${m[o + 4]},${m[o + 5]},${m[o + 6]},${m[o + 7]},${m[o + 8]},${m[o + 9]},${m[o + 10]},${m[o + 11]}`;
       let list = out.get(sig);
       if (!list) out.set(sig, (list = []));
-      list.push(this.instanceBounds(inst));
+      list.push(bounds);
     }
     return out;
   }
@@ -665,7 +733,9 @@ export class PagedShadowCore {
       const had = before.get(sig)?.length ?? 0;
       for (let i = had; i < news.length; i++) boxes.push(news[i]);
     }
-    if (this.regions.length / 8 + boxes.length > MAX_REGIONS) {
+    // Past the region budget boxes merge (invalidateBox); only a change far
+    // too large to be worth diffing re-renders everything.
+    if (boxes.length > MAX_REGIONS * 8) {
       this.invalidateAll();
       return "all";
     }
@@ -694,6 +764,21 @@ export class PagedShadowCore {
   /** Run the paging pipeline for this frame. Submit before the receivers render. */
   update(input: FrameInput): void {
     if (!this.computeGroup || !this.rasterGroup) throw new Error("PagedShadowCore.build() has not run");
+    // Fully faded shadows (night, the end of dusk) change no pixel: receivers
+    // return 1 before any lookup. Stop marking, paging and rasterising until
+    // they come back; invalidations keep accumulating (capped: past MAX_REGIONS
+    // they become one invalidateAll), and everything is re-rendered on wake.
+    if (this.tuning.darkness >= INVISIBLE_DARKNESS) {
+      if (!this.dormant) {
+        this.dormant = true;
+        this.device.queue.writeBuffer(this.paramsBuffer, SHADE_WORD * 4, new Float32Array([Math.min(1, this.tuning.darkness), 0, 0, 0]));
+      }
+      return;
+    }
+    if (this.dormant) {
+      this.dormant = false;
+      this.invalidateAll();
+    }
     const d = this.device;
     this.frame++;
     const lightDir = normalize(input.lightDir);
@@ -736,8 +821,14 @@ export class PagedShadowCore {
     cp.dispatchWorkgroups(wg(this.pageCount));
     cp.setPipeline(k.allocate);
     cp.dispatchWorkgroups(wg(this.slots));
-    cp.setPipeline(k.buildRenderList);
-    cp.dispatchWorkgroups(wg(this.slots));
+    // Coarsest level first (see K5): its pages never lose the budget to finer ones.
+    const perLevel = this.pagesPerSide * this.pagesPerSide;
+    cp.setPipeline(k.buildRenderListCoarse);
+    cp.dispatchWorkgroups(wg(perLevel));
+    if (this.levelCount > 1) {
+      cp.setPipeline(k.buildRenderListFine);
+      cp.dispatchWorkgroups(wg(this.slots - perLevel));
+    }
     cp.setPipeline(k.finalizeRenderList);
     cp.dispatchWorkgroups(1);
     cp.setPipeline(k.cullClusters);
@@ -849,12 +940,8 @@ export class PagedShadowCore {
     lv.dir = dir;
     lv.right = normalize(cross(ref, dir));
     lv.up = cross(dir, lv.right);
-    const c: Vec3 = [
-      (this.sceneMin[0] + this.sceneMax[0]) / 2,
-      (this.sceneMin[1] + this.sceneMax[1]) / 2,
-      (this.sceneMin[2] + this.sceneMax[2]) / 2,
-    ];
-    const r = Math.hypot(this.sceneMax[0] - c[0], this.sceneMax[1] - c[1], this.sceneMax[2] - c[2]) + 1;
+    const c = this.depthCentre;
+    const r = this.depthRadius + 1;
     lv.zMin = dot(c, dir) - r;
     lv.zRange = 2 * r;
     lv.invalidate = true;
@@ -953,9 +1040,13 @@ export class PagedShadowCore {
     this.dirtyInstances.clear();
   }
 
-  private instanceBounds(inst: number): [Vec3, Vec3] {
+  /** An instance's world AABB, or null when it is collapsed to zero scale (it casts nothing). */
+  private instanceBounds(inst: number): [Vec3, Vec3] | null {
     const g = this.geometries[this.instanceGeometry[inst]];
     const m = this.instanceMatrices.slice(inst * 12, inst * 12 + 12);
+    let linear = 0;
+    for (let r = 0; r < 3; r++) linear += Math.abs(m[r * 4]) + Math.abs(m[r * 4 + 1]) + Math.abs(m[r * 4 + 2]);
+    if (linear === 0) return null;
     const c: Vec3 = [0, 0, 0];
     const e: Vec3 = [0, 0, 0];
     for (let k = 0; k < 3; k++) {
@@ -1041,7 +1132,7 @@ export class PagedShadowCore {
     const computePL = d.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
     for (const entryPoint of [
       "updateSlots", "invalidateRegions", "collectPhys", "allocate",
-      "buildRenderList", "finalizeRenderList", "cullClusters", "finalizeDraws",
+      "buildRenderListCoarse", "buildRenderListFine", "finalizeRenderList", "cullClusters", "finalizeDraws",
     ]) {
       this.kernels[entryPoint] = d.createComputePipeline({
         label: `ps.${entryPoint}`,

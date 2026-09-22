@@ -186,7 +186,15 @@ try {
       r.second.luma0 = await meanLuma();
       sd2.setDarkness(1); await frames(5);
       r.second.luma1 = await meanLuma();
+      // Fully faded, the core does no GPU work at all (its frame counter stops)…
+      const frozenAt = sd2.core.stats.frame;
+      await frames(5);
+      r.second.dormant = sd2.core.dormant && sd2.core.stats.frame === frozenAt;
       sd2.setDarkness(0);
+      await frames(20);
+      // …and on waking it re-renders, so the shadows are back exactly as before.
+      r.second.woke = !sd2.core.dormant;
+      r.second.lumaAwake = await meanLuma();
       // Two shapes that differ only by fractions of a unit are two geometries. MeshBuilder keeps its
       // positions as number[], and hashing those through Uint32Array truncated every coordinate, so a
       // 1 m box and a 0.6 m box (all coordinates within ±0.5) shared one key and one shadow.
