@@ -141,7 +141,7 @@ function textureUVs(mesh: Mesh, texture: TextureLike): Float32Array | null {
 }
 
 /**
- * A texture as RGBA8 at `size`², rows in texture-memory order (the order the
+ * A texture as RGBA8 at `size`Â², rows in texture-memory order (the order the
  * shader samples in). Goes through a render target, which also decodes
  * compressed (KTX2) textures and resizes.
  * @internal exported for the consumer test
@@ -468,7 +468,16 @@ export class SundialBabylon {
    */
   addReceivers(materials: Material[]): void {
     for (const m of materials) {
-      if (canReceive(m) && !this.plugins.some((p) => p.target === m)) this.plugins.push(new SundialPlugin(m, this));
+      if (!canReceive(m) || this.plugins.some((p) => p.target === m)) continue;
+      // A material keeps its plugin for life, and Babylon rejects a second one
+      // of the same name. A material that an earlier (possibly disposed)
+      // instance reached is rebound to this one instead.
+      const existing = m.pluginManager?.getPlugin<SundialPlugin>("Sundial");
+      if (existing) {
+        existing.host = this;
+        existing.markAllDefinesAsDirty();
+        this.plugins.push(existing);
+      } else this.plugins.push(new SundialPlugin(m, this));
     }
   }
 
@@ -500,7 +509,8 @@ export class SundialBabylon {
     // Things may have moved while nothing was tracking them.
     if (on && !this.enabled) this.core.invalidateAll();
     this.enabled = on;
-    for (const p of this.plugins) p.markAllDefinesAsDirty();
+    // Only the plugins still bound here: a newer instance may have taken some over.
+    for (const p of this.plugins) if (p.host === this) p.markAllDefinesAsDirty();
   }
 
   /**
@@ -620,7 +630,8 @@ for (let k = 0; k < MAX_LIGHTS; k++) DEFINES[`PSLIGHT${k}`] = false;
  * untouched.
  */
 class SundialPlugin extends MaterialPluginBase {
-  private readonly host: SundialBabylon;
+  /** The instance whose shadows this material samples; rebound when a new instance adds it. */
+  host: SundialBabylon;
   readonly target: Material;
 
   constructor(material: Material, host: SundialBabylon) {

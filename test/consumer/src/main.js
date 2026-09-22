@@ -72,6 +72,19 @@ try {
       lateGround.material = late; lateGround.receiveShadows = true;
       await frames(10);
       r.late = { plugin: !!late.pluginManager?.getPlugin("Sundial"), enabled: !!lateGround.subMeshes[0].materialDefines?.PSENABLED };
+      // A host rebuilds its backend (World re-applies on camera swaps and vetoes): dispose, then a
+      // new instance on the same scene must take over the materials' existing receivers.
+      sd.dispose();
+      await frames(3);
+      const sd2 = new SundialBabylon(scene, sun, { sceneMin: [-20, -1, -20], sceneMax: [20, 10, 20], levels: 5 });
+      sd2.addCaster(ground); sd2.addCaster(box); sd2.addReceivers([mat, late]); sd2.start();
+      await frames(30);
+      r.second = {
+        rebound: mat.pluginManager.getPlugin("Sundial").host === sd2 && late.pluginManager.getPlugin("Sundial").host === sd2,
+        enabled: !!ground.subMeshes[0].materialDefines?.PSENABLED,
+        requested: sd2.core.stats.requestedPages,
+      };
+      r.core = () => sd2.core.stats;
       r.done = true;
     })().catch((e) => { r.error = String(e); r.done = true; });
   }

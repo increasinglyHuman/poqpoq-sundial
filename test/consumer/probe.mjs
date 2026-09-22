@@ -32,7 +32,9 @@ for (const engine of ["webgl2", "webgpu"]) {
       // darkness 1 hides every shadow: the whole frame gets measurably brighter
       res.lumaDark1 > res.lumaDark0 + 1 &&
       // a material made after start() picked up the receiver on its own
-      res.late.plugin && res.late.enabled);
+      res.late.plugin && res.late.enabled &&
+      // after dispose, a second instance took over the same materials and is paging
+      res.second.rebound && res.second.enabled && res.second.requested > 0);
   failed ||= !ok;
   console.log(ok ? "PASS" : "FAIL", engine, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "");
   await p.close();
