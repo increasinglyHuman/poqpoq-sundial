@@ -1,0 +1,9 @@
+{
+  "name": "sundial-consumer-test",
+  "private": true,
+  "type": "module",
+  "description": "Consumes @poqpoq/sundial the way World does: a file: dependency on the built package, with Babylon deduped.",
+  "scripts": { "dev": "vite", "test": "node probe.mjs" },
+  "dependencies": { "@poqpoq/sundial": "file:../..", "@babylonjs/core": "9.17.1" },
+  "devDependencies": { "vite": "^6.0.0" }
+}

@@ -138,6 +138,15 @@ export class SundialBabylon {
   private readonly scratch = new Matrix();
   private scratchMatrices: Float32Array = new Float32Array(0);
 
+  /**
+   * True when Sundial can run on this engine: a WebGPU engine whose device is
+   * ready. Call this before constructing; on WebGL2 keep the existing CSM.
+   * Importing this module is always safe, on any backend.
+   */
+  static isSupported(engine: AbstractEngine): boolean {
+    return !!engine.isWebGPU && !!(engine as unknown as { _device?: GPUDevice })._device;
+  }
+
   constructor(scene: Scene, light: DirectionalLight, options: PagedShadowOptions) {
     this.scene = scene;
     this.light = light;

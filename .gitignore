@@ -25,3 +25,7 @@ id_*
 .DS_Store
 Thumbs.db
 *.swp
+
+# consumer test install
+test/consumer/node_modules/
+test/consumer/package-lock.json
