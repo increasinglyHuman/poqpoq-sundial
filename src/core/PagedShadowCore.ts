@@ -186,6 +186,11 @@ export class PagedShadowCore {
   private readonly levels: LevelState[] = [];
 
   private geometries: BuiltGeometry[] = [];
+  /** Clustered geometry by caller key, kept across rebuilds; pruned to what the last build used. */
+  private geometryCache = new Map<string, BuiltGeometry>();
+  /** Keys registered since the last clearContent(), and the geometry index each got. */
+  private geometryKeys = new Map<string, number>();
+  private cacheHits = 0;
   private groups: InstanceGroup[] = [];
   private instanceMatrices: number[] = []; // 12 floats (3 affine rows) per instance
   private instanceGeometry: number[] = [];
@@ -297,9 +302,42 @@ export class PagedShadowCore {
 
   // ---- content ------------------------------------------------------------
 
-  addGeometry(input: GeometryInput): number {
+  /**
+   * Register a geometry. With a `key`, geometry registered again under the
+   * same key reuses its clusters: within one build it is the same geometry
+   * (instances share it), and across rebuilds the clustering is not redone.
+   * The key must change whenever the input does.
+   */
+  addGeometry(input: GeometryInput, key?: string): number {
+    if (key !== undefined) {
+      const known = this.geometryKeys.get(key);
+      if (known !== undefined) return known;
+      let built = this.geometryCache.get(key);
+      if (built) this.cacheHits++;
+      else {
+        built = buildGeometry(input, this.clusterTris);
+        this.geometryCache.set(key, built);
+      }
+      this.geometries.push(built);
+      this.geometryKeys.set(key, this.geometries.length - 1);
+      return this.geometries.length - 1;
+    }
     this.geometries.push(buildGeometry(input, this.clusterTris));
     return this.geometries.length - 1;
+  }
+
+  /**
+   * Forget every registered geometry and instance, ready to register the
+   * content again and build(). Clustered geometry stays cached by key.
+   */
+  clearContent(): void {
+    this.geometries = [];
+    this.geometryKeys.clear();
+    this.cacheHits = 0;
+    this.groups = [];
+    this.instanceMatrices = [];
+    this.instanceGeometry = [];
+    this.dirtyInstances.clear();
   }
 
   /** `matrices` holds 16 floats per instance, column-major with translation at 12..14 (Babylon and three.js layout). */
@@ -318,7 +356,8 @@ export class PagedShadowCore {
   setInstanceMatrix(group: InstanceGroup, index: number, matrix: Float32Array | number[]): void {
     const inst = group.first + index;
     const before = this.instanceBounds(inst);
-    this.instanceMatrices.splice(inst * 12, 12, ...affineRows(matrix, 0));
+    const rows = affineRows(matrix, 0);
+    for (let k = 0; k < 12; k++) this.instanceMatrices[inst * 12 + k] = rows[k];
     const after = this.instanceBounds(inst);
     this.invalidateBox(
       [Math.min(before[0][0], after[0][0]), Math.min(before[0][1], after[0][1]), Math.min(before[0][2], after[0][2])],
@@ -386,8 +425,15 @@ export class PagedShadowCore {
     }
   }
 
-  /** Pack all registered content into GPU buffers. Call once after adding content. */
+  /**
+   * Pack all registered content into GPU buffers. Call after adding content;
+   * call again after clearContent() and re-registering to replace it. A
+   * rebuild frees the previous buffers and re-renders every cached page.
+   */
   build(): void {
+    this.destroyContentBuffers();
+    for (const key of this.geometryCache.keys()) if (!this.geometryKeys.has(key)) this.geometryCache.delete(key);
+    if (this.started) this.invalidateAll();
     const clusterRecords: { geom: number; base: number }[] = [];
     let vertexBase = 0;
     let indexBase = 0;
@@ -469,8 +515,29 @@ export class PagedShadowCore {
     });
   }
 
+  /** Free every GPU resource. The core cannot be used afterwards. */
+  dispose(): void {
+    this.destroyContentBuffers();
+    for (const b of [this.paramsBuffer, this.pageTableBuffer, this.requestBuffer, this.counterBuffer, this.workBuffer, this.pairBuffer]) b.destroy();
+    for (const rb of this.readbacks) rb.buffer.destroy();
+    this.queryResolve?.destroy();
+    this.querySet?.destroy();
+    this.poolTexture.destroy();
+    this.alphaTexture.destroy();
+    this.geometryCache.clear();
+    this.depthBinding = null;
+  }
+
+  private destroyContentBuffers(): void {
+    for (const b of [this.sceneBuffer, this.clusterInstanceBuffer, this.vertexBuffer, this.indexBuffer]) b?.destroy();
+    this.sceneBuffer = this.clusterInstanceBuffer = this.vertexBuffer = this.indexBuffer = null;
+    this.computeGroup = this.rasterGroup = null;
+  }
+
   get contentSummary() {
     return {
+      /** Geometries registered since clearContent() that reused cached clusters. */
+      cachedGeometries: this.cacheHits,
       geometries: this.geometries.length,
       instances: this.instanceGeometry.length,
       clusters: this.clusterCount,

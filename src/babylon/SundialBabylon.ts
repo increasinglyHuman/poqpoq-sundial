@@ -5,6 +5,7 @@ import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { WebGPUEngine } from "@babylonjs/core/Engines/webgpuEngine";
 import type { Material } from "@babylonjs/core/Materials/material";
+import type { MultiMaterial } from "@babylonjs/core/Materials/multiMaterial";
 import type { MaterialDefines } from "@babylonjs/core/Materials/materialDefines";
 import type { SubMesh } from "@babylonjs/core/Meshes/subMesh";
 import type { UniformBuffer } from "@babylonjs/core/Materials/uniformBuffer";
@@ -72,12 +73,80 @@ export interface CasterOptions {
   capacity?: number;
 }
 
+/** A caster for setCasters(): a mesh, or a mesh with its options. */
+export type CasterEntry = Mesh | { mesh: Mesh; options?: CasterOptions };
+
 interface DynamicCaster {
   mesh: Mesh;
-  group: InstanceGroup;
+  /** One group per material the mesh casts with; all share the mesh's instances. */
+  groups: InstanceGroup[];
   /** 16 floats per instance: the final world matrices last uploaded. */
   last: Float32Array;
   warnedCount?: boolean;
+}
+
+/**
+ * The triangles of a mesh that cast, one run per material, following the
+ * SubMesh contract in the World wiki (Prim-Draw-Call-Reduction §10b):
+ * iterate SubMeshes, never subMaterials; a null MultiMaterial slot is a
+ * hidden face's pick slot and is skipped; slice by indexStart/indexCount,
+ * never by the (conservative) vertex range. The material is resolved the way
+ * the renderer resolves it, so a mesh with no material still casts (it draws
+ * with the scene's default material).
+ */
+function castingRuns(mesh: Mesh, indices: ArrayLike<number>): Map<Material | null, number[]> {
+  const runs = new Map<Material | null, number[]>();
+  const root = mesh.material;
+  const multi = root && (root as unknown as MultiMaterial).getSubMaterial ? (root as unknown as MultiMaterial) : null;
+  for (const sm of mesh.subMeshes ?? []) {
+    const material = multi ? multi.getSubMaterial(sm.materialIndex) : root;
+    if (multi && !material) continue;
+    let run = runs.get(material);
+    if (!run) runs.set(material, (run = []));
+    for (let i = sm.indexStart, end = sm.indexStart + sm.indexCount; i < end; i++) run.push(indices[i]);
+  }
+  return runs;
+}
+
+/** Two 32-bit hashes (FNV-1a and a murmur-style mix) of the arrays' raw bits, as 16 hex digits. */
+function contentHash(...parts: ArrayLike<number>[]): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193 ^ 0x5bd1e995;
+  for (const part of parts) {
+    const words =
+      part instanceof Float32Array || part instanceof Uint32Array || part instanceof Int32Array
+        ? new Uint32Array(part.buffer, part.byteOffset, part.length)
+        : Uint32Array.from(part as ArrayLike<number>);
+    for (let i = 0; i < words.length; i++) {
+      h1 = Math.imul(h1 ^ words[i], 0x01000193);
+      h2 = Math.imul(h2 ^ words[i], 0x5bd1e995) ^ (h2 >>> 15);
+    }
+    h1 = Math.imul(h1 ^ words.length, 0x01000193);
+  }
+  return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+}
+
+/** Keep only the vertices a run uses, so a mesh split by material does not upload its vertices once per material. */
+function compact(run: number[], positions: ArrayLike<number>, uvs?: ArrayLike<number> | null) {
+  const remap = new Map<number, number>();
+  const indices = new Uint32Array(run.length);
+  for (let i = 0; i < run.length; i++) {
+    let v = remap.get(run[i]);
+    if (v === undefined) remap.set(run[i], (v = remap.size));
+    indices[i] = v;
+  }
+  const outPositions = new Float32Array(remap.size * 3);
+  const outUvs = uvs ? new Float32Array(remap.size * 2) : undefined;
+  for (const [src, dst] of remap) {
+    outPositions[dst * 3] = positions[src * 3];
+    outPositions[dst * 3 + 1] = positions[src * 3 + 1];
+    outPositions[dst * 3 + 2] = positions[src * 3 + 2];
+    if (outUvs && uvs) {
+      outUvs[dst * 2] = uvs[src * 2];
+      outUvs[dst * 2 + 1] = uvs[src * 2 + 1];
+    }
+  }
+  return { positions: outPositions, indices, uvs: outUvs };
 }
 
 /**
@@ -133,6 +202,7 @@ export class SundialBabylon {
   private readonly dynamics: DynamicCaster[] = [];
   private readonly plugins: SundialPlugin[] = [];
   private observer: Observer<Scene> | null = null;
+  private running = false;
   private afterCameraObserver: Observer<Camera> | null = null;
   private depthSnapshot: DepthSnapshot | null = null;
   private readonly scratch = new Matrix();
@@ -174,18 +244,19 @@ export class SundialBabylon {
     this.pageTable = storage(this.core.pageTableBuffer);
   }
 
-  /** Register a mesh (and all of its thin instances) as a shadow caster. */
-  addCaster(mesh: Mesh, opts: CasterOptions = {}): InstanceGroup {
+  /**
+   * Register a mesh (and all of its thin instances) as a shadow caster, one
+   * group per material it draws with. SubMeshes whose MultiMaterial slot is
+   * null (hidden faces) do not cast. Clustering is cached by geometry and
+   * content, so registering the same content again is cheap.
+   */
+  addCaster(mesh: Mesh, opts: CasterOptions = {}): InstanceGroup[] {
     const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
     const indices = mesh.getIndices();
     if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
-    const uvs = opts.alphaLayer !== undefined ? mesh.getVerticesData(VertexBuffer.UVKind) ?? undefined : undefined;
-    const geometry = this.core.addGeometry({
-      positions: new Float32Array(positions),
-      indices: indices as number[],
-      uvs: uvs ? new Float32Array(uvs) : undefined,
-      alpha: opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined,
-    });
+    const alpha = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
+    const uvs = alpha ? mesh.getVerticesData(VertexBuffer.UVKind) : null;
+    const scope = `${mesh.geometry?.uniqueId ?? `mesh${mesh.uniqueId}`}:${contentHash(positions, uvs ?? [])}`;
     let matrices = casterMatrices(mesh);
     if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
       // Reserved slots start as zero matrices, which cast nothing.
@@ -193,9 +264,29 @@ export class SundialBabylon {
       padded.set(matrices);
       matrices = padded;
     }
-    const group = this.core.addInstances(geometry, matrices, !!opts.dynamic);
-    if (opts.dynamic) this.dynamics.push({ mesh, group, last: matrices.slice() });
-    return group;
+    const groups: InstanceGroup[] = [];
+    for (const run of castingRuns(mesh, indices).values()) {
+      if (run.length < 3) continue;
+      const key = `${scope}:${contentHash(run)}:${alpha ? `${alpha.layer}/${alpha.cutoff}` : "opaque"}`;
+      const geometry = this.core.addGeometry({ ...compact(run, positions, uvs), alpha }, key);
+      groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
+    }
+    if (opts.dynamic && groups.length) this.dynamics.push({ mesh, groups, last: matrices.slice() });
+    return groups;
+  }
+
+  /**
+   * Replace every registered caster and rebuild. Before start() this only
+   * registers; start() builds. Cached clusters make re-registering unchanged
+   * content cheap, so call this as content streams in (debounced: a rebuild
+   * re-renders every cached page). Returns each entry's groups, in order.
+   */
+  setCasters(entries: CasterEntry[]): InstanceGroup[][] {
+    this.dynamics.length = 0;
+    this.core.clearContent();
+    const groups = entries.map((e) => ("getClassName" in e ? this.addCaster(e) : this.addCaster(e.mesh, e.options)));
+    if (this.running) this.core.build();
+    return groups;
   }
 
   setAlphaMask(layer: number, source: HTMLCanvasElement | OffscreenCanvas | ImageBitmap, cutoff = 0.5): void {
@@ -211,6 +302,8 @@ export class SundialBabylon {
 
   /** Upload content and start running every frame. */
   start(): void {
+    if (this.running) return;
+    this.running = true;
     this.core.build();
     this.observer = this.scene.onBeforeRenderObservable.add(() => this.update());
     this.afterCameraObserver = this.scene.onAfterCameraRenderObservable.add((camera) => this.captureDepth(camera));
@@ -223,9 +316,19 @@ export class SundialBabylon {
     for (const p of this.plugins) p.markAllDefinesAsDirty();
   }
 
+  /**
+   * Stop, free every GPU resource and turn the receivers off (materials fall
+   * back to unshadowed sun light). The instance cannot be restarted.
+   */
   dispose(): void {
     this.observer?.remove();
     this.afterCameraObserver?.remove();
+    this.observer = this.afterCameraObserver = null;
+    this.setEnabled(false);
+    this.running = false;
+    this.dynamics.length = 0;
+    this.poolTexture.dispose();
+    this.core.dispose();
   }
 
   /**
@@ -292,7 +395,7 @@ export class SundialBabylon {
       const now = casterMatrices(d.mesh, this.scratchMatrices);
       this.scratchMatrices = now;
       const live = now.length / 16;
-      const slots = d.group.count;
+      const slots = d.groups[0].count;
       if (live > slots && !d.warnedCount) {
         d.warnedCount = true;
         console.warn(`Sundial: ${d.mesh.name} has ${live} thin instances but ${slots} registered slots; the extra instances do not cast. Pass { capacity } to addCaster.`);
@@ -309,7 +412,7 @@ export class SundialBabylon {
         }
         if (moved) {
           d.last.set(next, o);
-          this.core.setInstanceMatrix(d.group, i, next);
+          for (const g of d.groups) this.core.setInstanceMatrix(g, i, next);
         }
       }
     }

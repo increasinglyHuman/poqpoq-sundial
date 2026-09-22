@@ -20,7 +20,10 @@ for (const engine of ["webgl2", "webgpu"]) {
   await p.waitForTimeout(2500);
   const res = await p.evaluate(() => { const r = window.__result; return { ...r, core: r.core ? (({ requestedPages, residentPages, allocationFailures }) => ({ requestedPages, residentPages, allocationFailures }))(r.core()) : undefined }; });
     const ok = res.imported && !res.error && errs.length === 0 &&
-    (engine === "webgl2" ? res.supported === false : res.supported === true && res.core.requestedPages > 0 && res.core.allocationFailures === 0);
+    (engine === "webgl2" ? res.supported === false : res.supported === true && res.core.requestedPages > 0 && res.core.allocationFailures === 0 &&
+      // ground 32 + box 12 + the prim's 6 visible triangles (its hidden half must not cast)
+      res.firstBuild.triangles === 50 && res.firstBuild.geometries === 3 &&
+      res.rebuild?.cachedGeometries === 3 && res.rebuild.triangles === 50 && res.gpuErrors.length === 0);
   failed ||= !ok;
   console.log(ok ? "PASS" : "FAIL", engine, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "");
   await p.close();
