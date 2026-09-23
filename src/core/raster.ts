@@ -1,6 +1,37 @@
 import { COMMON_WGSL } from "./wgsl";
 import { SCENE_WGSL, type WorkLayout } from "./kernels";
 
+/**
+ * Linear blend skinning for skinned clusters (see skin.ts). The cluster's
+ * free word is 0 for rigid geometry, else the skin data's word offset in the
+ * index buffer + 1, with bit 31 set for 8 influences. Instance row \`row\` is
+ * the bounds row; bone b is row + 1 + b. Weights are renormalized, so the
+ * result is a convex combination of the bones' transforms of the vertex.
+ */
+const SKIN_WGSL = /* wgsl */ `
+fn psClusterSkin(i: u32) -> u32 { return bitcast<u32>(sceneData[i * 3u + 2u].w); }
+
+fn psSkinned(skin: u32, local: u32, row: u32, lp: vec3f) -> vec3f {
+  let eight = (skin & 0x80000000u) != 0u;
+  var o = (skin & 0x7fffffffu) - 1u + local * select(3u, 6u, eight);
+  var acc = vec3f(0.0);
+  var total = 0.0;
+  for (var s = 0u; s < select(1u, 2u, eight); s++) {
+    let ids = indices[o];
+    let w = vec4f(unpack2x16unorm(indices[o + 1u]), unpack2x16unorm(indices[o + 2u]));
+    for (var k = 0u; k < 4u; k++) {
+      if (w[k] > 0.0) {
+        let m = psInstance(row + 1u + ((ids >> (k * 8u)) & 0xffu));
+        acc += w[k] * vec3f(dot(m.r0.xyz, lp) + m.r0.w, dot(m.r1.xyz, lp) + m.r1.w, dot(m.r2.xyz, lp) + m.r2.w);
+        total += w[k];
+      }
+    }
+    o += 3u;
+  }
+  return acc / total;
+}
+`;
+
 // Raster stage. One draw per pipeline, whatever the scene size: each instance
 // is a (cluster instance, page) pair, and the vertex shader pulls the triangle,
 // transforms it into the page's light space and places it in the page's atlas
@@ -126,6 +157,8 @@ struct CasterIn {
 // vertex's index, or PS_NONE for a padding triangle past the cluster's end.
 struct CasterVertex { pos: vec4f, pageUv: vec2f, vtx: u32, cl: PsCluster };
 
+${SKIN_WGSL}
+
 fn casterVertex(vi: u32, pairIndex: u32) -> CasterVertex {
   var v: CasterVertex;
   let pair = pairs[pairIndex];
@@ -136,10 +169,17 @@ fn casterVertex(vi: u32, pairIndex: u32) -> CasterVertex {
     v.vtx = PS_NONE;
     return v;
   }
-  v.vtx = indices[v.cl.firstIndex + vi] + v.cl.vertexBase;
+  let local = indices[v.cl.firstIndex + vi];
+  v.vtx = local + v.cl.vertexBase;
   let lp = vec3f(vertices[v.vtx * 5u], vertices[v.vtx * 5u + 1u], vertices[v.vtx * 5u + 2u]);
-  let m = psInstance(ci.y);
-  let wp = vec3f(dot(m.r0.xyz, lp) + m.r0.w, dot(m.r1.xyz, lp) + m.r1.w, dot(m.r2.xyz, lp) + m.r2.w);
+  var wp: vec3f;
+  let skin = psClusterSkin(ci.x);
+  if (skin == 0u) {
+    let m = psInstance(ci.y);
+    wp = vec3f(dot(m.r0.xyz, lp) + m.r0.w, dot(m.r1.xyz, lp) + m.r1.w, dot(m.r2.xyz, lp) + m.r2.w);
+  } else {
+    wp = psSkinned(skin, local, ci.y, lp);
+  }
 
   let info = pageInfo(pair.y);
   let lv = psParams.levels[info.level];
