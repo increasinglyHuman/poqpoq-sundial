@@ -366,6 +366,7 @@ export class SundialBabylon {
   enabled = true;
 
   /** @internal */ readonly poolTexture: BaseTexture;
+  /** @internal */ readonly minMaxTexture: BaseTexture;
   /** @internal */ readonly params: StorageLike;
   /** @internal */ readonly pageTable: StorageLike;
 
@@ -427,6 +428,10 @@ export class SundialBabylon {
       aspect: "depth-only",
     });
     this.poolTexture = new BaseTexture(scene, internal);
+    // The receiver's PCF early-out (rg32uint, textureLoad only: no sampler).
+    const minMax = engine.wrapWebGPUTexture(this.core.minMaxTexture);
+    (minMax._hardwareTexture as unknown as { createView(d: GPUTextureViewDescriptor): void }).createView({ dimension: "2d" });
+    this.minMaxTexture = new BaseTexture(scene, minMax);
     this.params = storage(this.core.paramsBuffer);
     this.pageTable = storage(this.core.pageTableBuffer);
   }
@@ -619,6 +624,7 @@ export class SundialBabylon {
     this.running = false;
     this.dynamics.length = 0;
     this.poolTexture.dispose();
+    this.minMaxTexture.dispose();
     this.core.dispose();
   }
 
@@ -770,7 +776,9 @@ for (let k = 0; k < MAX_LIGHTS; k++) DEFINES[`PSLIGHT${k}`] = false;
  * Receiver injection. Each light's Sundial factor is computed at
  * CUSTOM_LIGHT{k}_COLOR and folded into Babylon's per-light shadow term with
  * min(), which Babylon applies to diffuse plus specular, sheen and clear coat.
- * No samplers are added, so terrain's 16-sampler budget is untouched.
+ * No samplers are added, so terrain's 16-sampler budget is untouched. It does
+ * add two sampled textures (psPool, psMinMax), read with textureLoad; World
+ * requests setMaximumLimits, where that limit is 48 on the adapters seen.
  */
 class SundialPlugin extends MaterialPluginBase {
   /** The instance whose shadows this material samples; rebound when a new instance adds it. */
@@ -810,7 +818,7 @@ class SundialPlugin extends MaterialPluginBase {
   }
 
   override getSamplers(samplers: string[]): void {
-    samplers.push("psPool");
+    samplers.push("psPool", "psMinMax");
   }
 
   override bindForSubMesh(_ubo: UniformBuffer, _scene: Scene, engine: AbstractEngine, subMesh: SubMesh): void {
@@ -818,6 +826,7 @@ class SundialPlugin extends MaterialPluginBase {
     const effect = subMesh.effect;
     if (!effect) return;
     effect.setTexture("psPool", this.host.poolTexture);
+    effect.setTexture("psMinMax", this.host.minMaxTexture);
     const gpu = engine as WebGPUEngine;
     gpu.setStorageBuffer("psParams", this.host.params as never);
     gpu.setStorageBuffer("psPageTable", this.host.pageTable as never);
@@ -835,6 +844,7 @@ ${COMMON_WGSL}
 var<storage, read> psParams: PsParams;
 var<storage, read> psPageTable: array<vec2u>;
 var psPool: texture_depth_2d;
+var psMinMax: texture_2d<u32>;
 ${(globalThis as { __psReceiver?: (s: string) => string }).__psReceiver?.(RECEIVER_WGSL) ?? RECEIVER_WGSL}
 #endif
 `,
