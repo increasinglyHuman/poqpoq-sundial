@@ -12,6 +12,7 @@ import type { SubMesh } from "@babylonjs/core/Meshes/subMesh";
 import type { UniformBuffer } from "@babylonjs/core/Materials/uniformBuffer";
 import type { AbstractEngine } from "@babylonjs/core/Engines/abstractEngine";
 import type { Observer } from "@babylonjs/core/Misc/observable";
+import type { Skeleton } from "@babylonjs/core/Bones/skeleton";
 import type { RenderTargetWrapper } from "@babylonjs/core/Engines/renderTargetWrapper";
 import { MaterialPluginBase } from "@babylonjs/core/Materials/materialPluginBase";
 import { ShaderLanguage } from "@babylonjs/core/Materials/shaderLanguage";
@@ -22,6 +23,7 @@ import { WebGPUDataBuffer } from "@babylonjs/core/Meshes/WebGPU/webgpuDataBuffer
 import { GetTextureDataAsync } from "@babylonjs/core/Misc/textureTools";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
 import type { GeometryInput } from "../core/geometry";
+import type { SkinInput } from "../core/skin";
 import { COMMON_WGSL, RECEIVER_WGSL } from "../core/wgsl";
 
 // Babylon adapter. The core owns every GPU resource and runs on Babylon's own
@@ -64,7 +66,12 @@ function storage(buffer: GPUBuffer): StorageLike {
 }
 
 export interface CasterOptions {
-  /** Re-read the world matrix every frame and invalidate what it moved over. */
+  /**
+   * Re-read the world matrix every frame and invalidate what it moved over.
+   * A dynamic mesh with a skeleton (and bone indices and weights) casts its
+   * skinned pose, skinned on the GPU from the skeleton's matrices each frame.
+   * Morph targets are not applied.
+   */
   dynamic?: boolean;
   /**
    * Alpha-tested caster with a mask you supply: the layer registered with
@@ -222,6 +229,8 @@ interface DynamicCaster {
   /** Whether the matrices were last read through the thin-instance buffer. */
   thin: boolean;
   warnedCount?: boolean;
+  /** Skinned casters: the skeleton, and its bone matrices as last uploaded (16 floats per bone). */
+  skin?: { skeleton: Skeleton; bones: Float32Array };
 }
 
 /** Babylon internals updateDynamics reads to tell, without recomputing, that a world matrix is unchanged. */
@@ -371,6 +380,47 @@ function sameSignature(a: unknown[], b: unknown[]): boolean {
 }
 
 /** Keep only the vertices a run uses, so a mesh split by material does not upload its vertices once per material. */
+/** Whether a caster takes the skinned path: dynamic, with a skeleton and bone influences. */
+function isSkinned(mesh: Mesh, opts: CasterOptions): boolean {
+  return (
+    !!opts.dynamic &&
+    !!mesh.skeleton &&
+    mesh.skeleton.bones.length > 0 &&
+    mesh.isVerticesDataPresent(VertexBuffer.MatricesIndicesKind) &&
+    mesh.isVerticesDataPresent(VertexBuffer.MatricesWeightsKind)
+  );
+}
+
+/** A skinned mesh's influences, in its own vertex order. */
+function readSkin(mesh: Mesh): SkinInput {
+  return {
+    boneCount: mesh.skeleton!.bones.length,
+    indices: mesh.getVerticesData(VertexBuffer.MatricesIndicesKind)!,
+    weights: mesh.getVerticesData(VertexBuffer.MatricesWeightsKind)!,
+    indicesExtra: mesh.getVerticesData(VertexBuffer.MatricesIndicesExtraKind),
+    weightsExtra: mesh.getVerticesData(VertexBuffer.MatricesWeightsExtraKind),
+  };
+}
+
+/** A run's skin influences, compacted with the same remap as compact() gives its positions. */
+function compactSkin(skin: SkinInput, run: ArrayLike<number>): SkinInput {
+  const remap = new Map<number, number>();
+  for (let i = 0; i < run.length; i++) if (!remap.has(run[i])) remap.set(run[i], remap.size);
+  const pick = (src: ArrayLike<number> | null | undefined) => {
+    if (!src) return null;
+    const out = new Float32Array(remap.size * 4);
+    for (const [from, to] of remap) for (let k = 0; k < 4; k++) out[to * 4 + k] = src[from * 4 + k];
+    return out;
+  };
+  return {
+    boneCount: skin.boneCount,
+    indices: pick(skin.indices)!,
+    weights: pick(skin.weights)!,
+    indicesExtra: pick(skin.indicesExtra),
+    weightsExtra: pick(skin.weightsExtra),
+  };
+}
+
 function compact(run: ArrayLike<number>, positions: ArrayLike<number>, uvs?: ArrayLike<number> | null) {
   const remap = new Map<number, number>();
   const indices = new Uint32Array(run.length);
@@ -638,7 +688,16 @@ export class SundialBabylon {
     if (!geometry) return null;
     const hook = watchGeometry(geometry);
     const sig: unknown[] = [geometry, hook, geometryVersions.get(geometry) ?? 0, mesh.getTotalVertices()];
-    for (const kind of [VertexBuffer.PositionKind, VertexBuffer.UVKind, VertexBuffer.UV2Kind]) {
+    const skinned = isSkinned(mesh, opts);
+    sig.push(skinned, skinned ? mesh.skeleton : null, skinned ? mesh.skeleton!.bones.length : 0);
+    const kinds = [VertexBuffer.PositionKind, VertexBuffer.UVKind, VertexBuffer.UV2Kind];
+    if (skinned) {
+      kinds.push(
+        VertexBuffer.MatricesIndicesKind, VertexBuffer.MatricesWeightsKind,
+        VertexBuffer.MatricesIndicesExtraKind, VertexBuffer.MatricesWeightsExtraKind,
+      );
+    }
+    for (const kind of kinds) {
       const vb = mesh.getVertexBuffer(kind);
       sig.push(vb, vb?.getData() ?? null);
     }
@@ -727,6 +786,10 @@ export class SundialBabylon {
           // casterMatrices just computed it: the flag of exactly the matrix `last` was built from.
           worldFlag: (mesh as WorldState)._worldMatrix.updateFlag,
           thin: mesh.thinInstanceCount > 0 && !!thinMatrixData(mesh),
+          // NaN: the first update always uploads the pose.
+          skin: isSkinned(mesh, opts)
+            ? { skeleton: mesh.skeleton!, bones: new Float32Array(mesh.skeleton!.bones.length * 16).fill(NaN) }
+            : undefined,
         });
       } else {
         let list = this.statics.get(mesh);
@@ -746,7 +809,11 @@ export class SundialBabylon {
     // Content-addressed, not by Babylon's geometry id: a prim that is deleted and
     // re-created with the same shape (World does this on load and on edits) keeps
     // its clusters, and identical shapes on different meshes share one geometry.
-    const scope = `${positions.length}:${contentHash(positions)}`;
+    const skin = isSkinned(mesh, opts) ? readSkin(mesh) : null;
+    const skinKey = skin
+      ? `:skin${skin.boneCount}:${contentHash(skin.indices, skin.weights, skin.indicesExtra ?? [], skin.weightsExtra ?? [])}`
+      : "";
+    const scope = `${positions.length}:${contentHash(positions)}${skinKey}`;
     const out: { key: string; input: () => GeometryInput }[] = [];
     for (const [material, run] of castingRuns(mesh, indices)) {
       if (run.length < 3) continue;
@@ -763,7 +830,7 @@ export class SundialBabylon {
       if (!alpha) uvs = null;
       const key = `${scope}:${contentHash(run)}:${alpha ? `${alpha.layer}/${alpha.cutoff}:${contentHash(uvs!)}` : "opaque"}`;
       // Compacted only on a cache miss: on a rebuild of unchanged content it is never needed.
-      out.push({ key, input: () => ({ ...compact(run, positions, uvs), alpha }) });
+      out.push({ key, input: () => ({ ...compact(run, positions, uvs), alpha, skin: skin ? compactSkin(skin, run) : undefined }) });
     }
     return out;
   }
@@ -948,6 +1015,58 @@ export class SundialBabylon {
   }
 
   /**
+   * A skinned dynamic caster: re-read its skeleton's matrices and its
+   * instances' world matrices, and re-pose every instance when either changed
+   * (the bones are shared by all of a mesh's thin instances). Allocates nothing.
+   */
+  private updateSkinned(d: DynamicCaster, skin: NonNullable<DynamicCaster["skin"]>): void {
+    const mesh = d.mesh;
+    // Babylon prepares skeletons while it evaluates active meshes, after
+    // onBeforeRender: prepare now so this frame's shadow has this frame's pose
+    // (Babylon's own prepare later computes the same matrices again).
+    skin.skeleton.prepare(true);
+    const bones = skin.skeleton.getTransformMatrices(mesh);
+    const last = skin.bones;
+    let posed = false;
+    for (let k = 0; k < last.length; k++) {
+      if (bones[k] !== last[k]) {
+        posed = true;
+        break;
+      }
+    }
+    if (posed) for (let k = 0; k < last.length; k++) last[k] = bones[k];
+    const world = mesh.computeWorldMatrix(true);
+    const slots = d.groups[0].count;
+    const data = thinMatrixData(mesh);
+    const count = mesh.thinInstanceCount;
+    const thin = count > 0 && !!data;
+    const live = thin ? count : 1;
+    if (live > slots && !d.warnedCount) {
+      d.warnedCount = true;
+      console.warn(`Sundial: ${mesh.name} has ${live} thin instances but ${slots} registered slots; the extra instances do not cast. Pass { capacity } to addCaster.`);
+    }
+    const now = d.now;
+    if (thin) {
+      for (let i = 0, n = Math.min(live, slots); i < n; i++) {
+        Matrix.FromArrayToRef(data!, i * 16, LOCAL);
+        LOCAL.multiplyToRef(world, PRODUCT);
+        now.set(PRODUCT.m, i * 16);
+      }
+    } else now.set(world.m, 0);
+    for (let i = 0; i < slots; i++) {
+      const o = i * 16;
+      // Slots past the live count collapse to a zero matrix, which casts nothing.
+      const src = i < live ? now : ZERO_MATRIX;
+      const so = i < live ? o : 0;
+      let moved = posed;
+      for (let k = 0; k < 16 && !moved; k++) if (src[so + k] !== d.last[o + k]) moved = true;
+      if (!moved) continue;
+      for (let k = 0; k < 16; k++) d.last[o + k] = src[so + k];
+      for (const g of d.groups) this.core.setSkinPose(g, i, src, so, last, 0);
+    }
+  }
+
+  /**
    * Re-read every dynamic caster's instance matrices and upload the ones that
    * moved. Thin-instanced casters are tracked per instance (review F2). The
    * thin-instance count may change at runtime within the registered capacity:
@@ -958,6 +1077,10 @@ export class SundialBabylon {
    */
   private updateDynamics(): void {
     for (const d of this.dynamics) {
+      if (d.skin) {
+        this.updateSkinned(d, d.skin);
+        continue;
+      }
       const mesh = d.mesh as WorldState;
       const slots = d.groups[0].count;
       const data = thinMatrixData(mesh);
