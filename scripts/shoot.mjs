@@ -21,7 +21,7 @@ const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
 const logs = [];
 page.on("console", (m) => { if (m.type() === "error" || m.type() === "warning") logs.push(`[${m.type()}] ${m.text()}`); });
 page.on("pageerror", (e) => logs.push(`[pageerror] ${e.message}`));
-await page.goto(query.startsWith("/") ? `http://localhost:5188${query}` : `http://localhost:5188/?${query}`);
+await page.goto(query.startsWith("/") ? `http://localhost:${process.env.PORT ?? 5188}${query}` : `http://localhost:${process.env.PORT ?? 5188}/?${query}`);
 await page.waitForFunction(() => window.__ready === true, null, { timeout: 60000 }).catch(() => logs.push("[timeout] never ready"));
 await page.waitForTimeout(settle);
 const info = await page.evaluate(() => ({
