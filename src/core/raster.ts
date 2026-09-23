@@ -13,6 +13,28 @@ export function rasterWGSL(w: WorkLayout, maxPairs: number, useClipDistances: bo
     ? "out.clip = array<f32, 4>(pageUv.x, 1.0 - pageUv.x, pageUv.y, 1.0 - pageUv.y);"
     : "";
   const clipCull = useClipDistances ? "out.clip = array<f32, 4>(-1.0, -1.0, -1.0, -1.0);" : "";
+  // With clip distances the opaque pipeline has no fragment stage, so its
+  // vertex stage outputs only what the rasterizer needs: no UVs, no alpha
+  // record, no page UV (the discard fallback and the alpha pipeline keep them).
+  const opaqueVS = useClipDistances
+    ? `struct OpaqueOut {
+  @builtin(position) pos: vec4f,
+  @builtin(clip_distances) clip: array<f32, 4>,
+};
+
+@vertex
+fn opaqueVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> OpaqueOut {
+  let v = casterVertex(vi, ii);
+  var out: OpaqueOut;
+  out.pos = v.pos;
+  out.clip = array<f32, 4>(v.pageUv.x, 1.0 - v.pageUv.x, v.pageUv.y, 1.0 - v.pageUv.y);
+  if (v.vtx == PS_NONE) { out.clip = array<f32, 4>(-1.0, -1.0, -1.0, -1.0); }
+  return out;
+}`
+    : `@vertex
+fn opaqueVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {
+  return caster(vi, ii);
+}`;
   const clipTest = useClipDistances
     ? ""
     : "if (any(in.pageUv < vec2f(0.0)) || any(in.pageUv > vec2f(1.0))) { discard; }";
@@ -83,38 +105,51 @@ struct CasterIn {
   @location(2) @interpolate(flat) alpha: vec2u,
 };
 
-fn caster(vi: u32, pairIndex: u32) -> CasterOut {
-  var out: CasterOut;
+// Position of one caster vertex in its page's atlas rectangle. vtx is the
+// vertex's index, or PS_NONE for a padding triangle past the cluster's end.
+struct CasterVertex { pos: vec4f, pageUv: vec2f, vtx: u32, cl: PsCluster };
+
+fn casterVertex(vi: u32, pairIndex: u32) -> CasterVertex {
+  var v: CasterVertex;
   let pair = pairs[pairIndex];
   let ci = clusterInstances[pair.x];
-  let cl = psCluster(ci.x);
-  if (vi / 3u >= cl.triCount) {
-    out.pos = vec4f(0.0, 0.0, 2.0, 1.0);   // padding triangle: outside the depth range
-    ${clipCull}
-    return out;
+  v.cl = psCluster(ci.x);
+  if (vi / 3u >= v.cl.triCount) {
+    v.pos = vec4f(0.0, 0.0, 2.0, 1.0);   // padding triangle: outside the depth range
+    v.vtx = PS_NONE;
+    return v;
   }
-  let vtx = indices[cl.firstIndex + vi] + cl.vertexBase;
-  let lp = vec3f(vertices[vtx * 5u], vertices[vtx * 5u + 1u], vertices[vtx * 5u + 2u]);
+  v.vtx = indices[v.cl.firstIndex + vi] + v.cl.vertexBase;
+  let lp = vec3f(vertices[v.vtx * 5u], vertices[v.vtx * 5u + 1u], vertices[v.vtx * 5u + 2u]);
   let m = psInstance(ci.y);
   let wp = vec3f(dot(m.r0.xyz, lp) + m.r0.w, dot(m.r1.xyz, lp) + m.r1.w, dot(m.r2.xyz, lp) + m.r2.w);
 
   let info = pageInfo(pair.y);
   let lv = psParams.levels[info.level];
-  let pageUv = vec2f(dot(wp, lv.right.xyz), dot(wp, lv.up.xyz)) * lv.up.w - vec2f(info.page);
-  let atlas = info.atlasOrigin + pageUv * f32(psParams.pool.z);
+  v.pageUv = vec2f(dot(wp, lv.right.xyz), dot(wp, lv.up.xyz)) * lv.up.w - vec2f(info.page);
+  let atlas = info.atlasOrigin + v.pageUv * f32(psParams.pool.z);
   let depth = (dot(wp, lv.dir.xyz) - lv.depth.x) * lv.depth.y;
-  out.pos = vec4f(atlasToClip(atlas), clamp(depth, 0.0, 1.0), 1.0);
+  v.pos = vec4f(atlasToClip(atlas), clamp(depth, 0.0, 1.0), 1.0);
+  return v;
+}
+
+fn caster(vi: u32, pairIndex: u32) -> CasterOut {
+  var out: CasterOut;
+  let v = casterVertex(vi, pairIndex);
+  out.pos = v.pos;
+  if (v.vtx == PS_NONE) {
+    ${clipCull}
+    return out;
+  }
+  let pageUv = v.pageUv;
   ${clipAssign}
   out.pageUv = pageUv;
-  out.uv = vec2f(vertices[vtx * 5u + 3u], vertices[vtx * 5u + 4u]);
-  out.alpha = vec2u(cl.alphaLayer, bitcast<u32>(cl.alphaCutoff));
+  out.uv = vec2f(vertices[v.vtx * 5u + 3u], vertices[v.vtx * 5u + 4u]);
+  out.alpha = vec2u(v.cl.alphaLayer, bitcast<u32>(v.cl.alphaCutoff));
   return out;
 }
 
-@vertex
-fn opaqueVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {
-  return caster(vi, ii);
-}
+${opaqueVS}
 
 @vertex
 fn alphaVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {

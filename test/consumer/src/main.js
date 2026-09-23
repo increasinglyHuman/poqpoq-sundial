@@ -206,6 +206,18 @@ try {
         await frames(5);
         r.distinct = { numberArrays: Array.isArray(small.getVerticesData("position")), added: sd2.core.contentSummary.geometries - before };
       }
+      // A pair list too small for the scene: a page that lost casters must not be kept as if it
+      // were complete. It is rendered again next frame (falling back a level meanwhile), so pages
+      // keep rendering for a while; kept, they would all have settled, holes and all, by frame 3.
+      if (gpu) {
+        sd2.dispose();
+        await frames(3);
+        const sd3 = new SundialBabylon(scene, sun, { sceneMin: [-20, -1, -20], sceneMax: [20, 10, 20], levels: 5, maxPairs: 4 });
+        sd3.addCaster(ground); sd3.addCaster(box); sd3.addReceivers([mat, late, ...(pbrGround ? [pbrGround] : [])]); sd3.start();
+        await frames(8);
+        r.overflow = { rendered: sd3.core.stats.renderedPages, dropped: sd3.core.stats.droppedPairs, frame: sd3.core.stats.frame };
+        sd3.dispose();
+      }
       r.core = () => sd2.core.stats;
       r.done = true;
     })().catch((e) => { r.error = String(e); r.done = true; });

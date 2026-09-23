@@ -50,6 +50,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1 &&
       // fully faded shadows stop all GPU work, and come back unchanged on waking
       res.second.dormant && res.second.woke && Math.abs(res.second.lumaAwake - res.second.luma0) < 0.02 &&
+      // an overflowing pair list re-renders the pages that lost casters instead of keeping them
+      res.overflow.rendered > 0 && res.overflow.dropped > 0 &&
       // a second (Babylon) shadow on the same caster does not darken the overlap twice
       (!res.csm || (res.csm.babylonOnly < res.csm.noShadow - 0.1 &&
         Math.abs(res.csm.both - res.csm.sundialOnly) < 0.35 * (res.csm.noShadow - res.csm.sundialOnly))));

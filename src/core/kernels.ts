@@ -1,4 +1,4 @@
-import { COMMON_WGSL } from "./wgsl";
+import { COMMON_WGSL, MAX_LEVELS } from "./wgsl";
 
 // Counter slots in the `counters` buffer.
 export const C_FREE = 0;
@@ -12,7 +12,18 @@ export const C_ALPHA_PAIRS = 7;
 export const C_RESIDENT = 8;
 export const C_REQUESTED = 9;
 export const C_DEFERRED = 10;
+/** Scalar counters: the ones cleared every frame and read back for stats. */
 export const COUNTER_COUNT = 16;
+/**
+ * Per level, the rect of pages being rendered this frame: 4 u32 per level
+ * after the scalar counters. The counters buffer is cleared every frame and is
+ * the only atomic one, so the rect is stored in a form whose empty value is 0
+ * and that grows with atomicMax: (n - minX, n - minY, maxX + 1, maxY + 1) in
+ * window-local page coords. Not read back.
+ */
+export const C_LEVEL_RECT = COUNTER_COUNT;
+/** u32 words in the counters buffer. */
+export const COUNTER_WORDS = COUNTER_COUNT + 4 * MAX_LEVELS;
 
 /** Frames a page may go unrequested before it is preferred for eviction. */
 const OLD_AGE = 30;
@@ -29,6 +40,13 @@ export interface WorkLayout {
   lists: number; // free | old | recent, pageCount each
   renderList: number;
   indirect: number; // clear, opaque, alpha draw args: 4 u32 each
+  /**
+   * The cull's dispatchWorkgroupsIndirect args (3 u32), written by
+   * finalizeRenderList. The work buffer is bound writable in the paging pass,
+   * and a buffer may not be writable storage and indirect in one dispatch, so
+   * the host copies these 12 bytes into a separate indirect buffer.
+   */
+  dispatch: number;
   total: number;
 }
 
@@ -40,7 +58,8 @@ export function workLayout(slots: number, pages: number, renderBudgetMax: number
   const lists = physLastUsed + pages;
   const renderList = lists + pages * 3;
   const indirect = renderList + renderBudgetMax;
-  return { slotState, slotRender, physOwner, physLastUsed, lists, renderList, indirect, total: indirect + 12 };
+  const dispatch = indirect + 12;
+  return { slotState, slotRender, physOwner, physLastUsed, lists, renderList, indirect, dispatch, total: dispatch + 4 };
 }
 
 /**
@@ -86,6 +105,8 @@ const W_PHYS_LAST: u32 = ${w.physLastUsed}u;
 const W_LISTS: u32 = ${w.lists}u;
 const W_RENDER_LIST: u32 = ${w.renderList}u;
 const W_INDIRECT: u32 = ${w.indirect}u;
+const W_DISPATCH: u32 = ${w.dispatch}u;
+const C_LEVEL_RECT: u32 = ${C_LEVEL_RECT}u;
 const MAX_PAIRS: u32 = ${maxPairs}u;
 
 fn slotCount() -> u32 { return psParams.grid.x * psParams.grid.y * psParams.grid.y; }
@@ -98,15 +119,17 @@ fn slotPage(lv: PsLevel, local: u32, n: u32) -> vec2i {
   return vec2i(lv.window.x + psWrap(sx - lv.window.x, ni), lv.window.y + psWrap(sy - lv.window.y, ni));
 }
 
-// Light-space page rect of a world AABB, clamped to the level's window.
-fn pageRect(lv: PsLevel, c: vec3f, e: vec3f, n: i32) -> vec4i {
-  let cx = dot(c, lv.right.xyz);
-  let cy = dot(c, lv.up.xyz);
-  let hx = dot(e, abs(lv.right.xyz));
-  let hy = dot(e, abs(lv.up.xyz));
-  let p0 = max(vec2i(floor(vec2f(cx - hx, cy - hy) * lv.up.w)), lv.window.xy);
-  let p1 = min(vec2i(floor(vec2f(cx + hx, cy + hy) * lv.up.w)), lv.window.xy + vec2i(n - 1));
+// Page rect of a light-space box (centre, half size), clamped to the level's window.
+fn pageRectLs(lv: PsLevel, cxy: vec2f, hxy: vec2f, n: i32) -> vec4i {
+  let p0 = max(vec2i(floor((cxy - hxy) * lv.up.w)), lv.window.xy);
+  let p1 = min(vec2i(floor((cxy + hxy) * lv.up.w)), lv.window.xy + vec2i(n - 1));
   return vec4i(p0, p1);
+}
+
+// Light-space page rect of a world AABB (centre, half extents).
+fn pageRect(lv: PsLevel, c: vec3f, e: vec3f, n: i32) -> vec4i {
+  let cxy = vec2f(dot(c, lv.right.xyz), dot(c, lv.up.xyz));
+  return pageRectLs(lv, cxy, vec2f(dot(e, abs(lv.right.xyz)), dot(e, abs(lv.up.xyz))), n);
 }
 
 // K1: retag scrolled slots, apply level invalidation, gather requests.
@@ -245,43 +268,101 @@ fn listPage(idx: u32) {
   work[W_RENDER_LIST + r] = idx;
   work[W_SLOT_RENDER + idx] = r;
   psPageTable[idx].x = e.x | PS_VALID;
+  // Grow this level's rect of rendered pages (see C_LEVEL_RECT), so the cull
+  // skips levels, and the parts of levels, where nothing is being drawn.
+  let n = psParams.grid.y;
+  let level = idx / (n * n);
+  let local = vec2u(psUnpackTag(e.y) - psParams.levels[level].window.xy);
+  let o = C_LEVEL_RECT + level * 4u;
+  atomicMax(&counters[o], n - local.x);
+  atomicMax(&counters[o + 1u], n - local.y);
+  atomicMax(&counters[o + 2u], local.x + 1u);
+  atomicMax(&counters[o + 3u], local.y + 1u);
 }
 
 @compute @workgroup_size(1)
 fn finalizeRenderList() {
+  let rendered = min(atomicLoad(&counters[${C_RENDER}]), psParams.grid.w);
   work[W_INDIRECT + 0u] = 6u;
-  work[W_INDIRECT + 1u] = min(atomicLoad(&counters[${C_RENDER}]), psParams.grid.w);
+  work[W_INDIRECT + 1u] = rendered;
   work[W_INDIRECT + 2u] = 0u;
   work[W_INDIRECT + 3u] = 0u;
+  // The cull runs one thread per cluster instance. On the common static frame
+  // (no page to render) it is not launched at all, instead of being launched
+  // over the whole scene only for every thread to return.
+  work[W_DISPATCH + 0u] = select(0u, (psParams.misc.y + 63u) / 64u, rendered > 0u);
+  work[W_DISPATCH + 1u] = 1u;
+  work[W_DISPATCH + 2u] = 1u;
 }
 
+// Each level's rect of rendered pages, absolute page coords (min.xy, max.zw);
+// empty (min > max) where the level renders nothing this frame.
+var<workgroup> renderedRects: array<vec4i, PS_MAX_LEVELS>;
+
 // K6: pair every cluster instance with each page being rendered that it overlaps.
+// Dispatched indirectly: not at all on a frame that renders no page.
 @compute @workgroup_size(64)
-fn cullClusters(@builtin(global_invocation_id) gid: vec3u) {
+fn cullClusters(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+  let n = i32(psParams.grid.y);
+  // One load per level per workgroup instead of four atomics per level per thread.
+  if (li < psParams.grid.x) {
+    let o = C_LEVEL_RECT + li * 4u;
+    let w = psParams.levels[li].window.xy;
+    let lo = w + vec2i(n) - vec2i(i32(atomicLoad(&counters[o])), i32(atomicLoad(&counters[o + 1u])));
+    let hi = w + vec2i(i32(atomicLoad(&counters[o + 2u])), i32(atomicLoad(&counters[o + 3u]))) - vec2i(1);
+    renderedRects[li] = vec4i(lo, hi);
+  }
+  workgroupBarrier();
   let i = gid.x;
   if (i >= psParams.misc.y) { return; }
-  if (atomicLoad(&counters[${C_RENDER}]) == 0u) { return; }
   let ci = clusterInstances[i];
   let cl = psCluster(ci.x);
   let m = psInstance(ci.y);
   let lc = (cl.aabbMin + cl.aabbMax) * 0.5;
   let le = (cl.aabbMax - cl.aabbMin) * 0.5;
   let c = vec3f(dot(m.r0.xyz, lc) + m.r0.w, dot(m.r1.xyz, lc) + m.r1.w, dot(m.r2.xyz, lc) + m.r2.w);
-  let e = vec3f(dot(abs(m.r0.xyz), le), dot(abs(m.r1.xyz), le), dot(abs(m.r2.xyz), le));
-  let n = i32(psParams.grid.y);
+  // The transformed cluster box is an oriented box with these half axes.
+  // Projecting it straight onto each level's light axes is its exact extent;
+  // going through a world AABB first inflated it twice.
+  let a0 = vec3f(m.r0.x, m.r1.x, m.r2.x) * le.x;
+  let a1 = vec3f(m.r0.y, m.r1.y, m.r2.y) * le.y;
+  let a2 = vec3f(m.r0.z, m.r1.z, m.r2.z) * le.z;
   let isAlpha = cl.alphaLayer != PS_NONE;
   for (var level = 0u; level < psParams.grid.x; level++) {
-    let rect = pageRect(psParams.levels[level], c, e, n);
+    let live = renderedRects[level];
+    if (live.x > live.z) { continue; }
+    let lv = psParams.levels[level];
+    let ax = lv.right.xyz;
+    let ay = lv.up.xyz;
+    // Exact support of the box, plus 1/1000 of a page so f32 rounding (the
+    // vertex stage transforms in another order) can never shave a triangle off
+    // a page it reaches: 1/8 texel at 128 texels a page, while a triangle must
+    // reach half a texel into a page to cover a sample there.
+    let pad = 1e-3 * lv.right.w;
+    let h = vec2f(abs(dot(ax, a0)) + abs(dot(ax, a1)) + abs(dot(ax, a2)),
+                  abs(dot(ay, a0)) + abs(dot(ay, a1)) + abs(dot(ay, a2))) + vec2f(pad);
+    let full = pageRectLs(lv, vec2f(dot(c, ax), dot(c, ay)), h, n);
+    let rect = vec4i(max(full.xy, live.xy), min(full.zw, live.zw));
     for (var y = rect.y; y <= rect.w; y++) {
       for (var x = rect.x; x <= rect.z; x++) {
         let r = work[W_SLOT_RENDER + psSlotIndex(level, x, y, u32(n))];
         if (r == PS_NONE) { continue; }
+        var k: u32;
         if (isAlpha) {
-          let k = atomicAdd(&counters[${C_ALPHA_PAIRS}], 1u);
+          k = atomicAdd(&counters[${C_ALPHA_PAIRS}], 1u);
           if (k < MAX_PAIRS) { pairs[MAX_PAIRS + k] = vec2u(i, r); }
         } else {
-          let k = atomicAdd(&counters[${C_OPAQUE_PAIRS}], 1u);
+          k = atomicAdd(&counters[${C_OPAQUE_PAIRS}], 1u);
           if (k < MAX_PAIRS) { pairs[k] = vec2u(i, r); }
+        }
+        // Pair list full: this page is drawn without this cluster. listPage
+        // already marked it valid, so it would keep the hole until its next
+        // invalidation. Unmark it: receivers fall back a level this frame and
+        // it is rendered again next frame. Every writer stores the same bits,
+        // and the raster reads only the phys and tag fields.
+        if (k >= MAX_PAIRS) {
+          let slot = work[W_RENDER_LIST + r];
+          psPageTable[slot].x = psPageTable[slot].x & ~PS_VALID;
         }
       }
     }
@@ -313,7 +394,17 @@ ${COMMON_WGSL}
 @compute @workgroup_size(8, 8)
 fn markPages(@builtin(global_invocation_id) gid: vec3u) {
   let stride = u32(psParams.screen.z);
-  let px = gid.xy * stride + vec2u(stride / 2u);
+  // One sample per stride x stride cell: its centre, or with rotation on
+  // (shade.y), a different pixel of the cell every frame, so that over
+  // stride^2 frames every pixel is sampled. A page is only evicted after going
+  // unrequested for OLD_AGE frames, so a sparser stride keeps what it misses in
+  // one frame resident through the next.
+  var offset = vec2u(stride / 2u);
+  if (psParams.shade.y != 0.0) {
+    let k = psParams.grid.z % (stride * stride);
+    offset = vec2u(k % stride, (k / stride + k % stride) % stride);
+  }
+  let px = gid.xy * stride + offset;
   let size = vec2u(psParams.screen.xy);
   if (px.x >= size.x || px.y >= size.y) { return; }
   let d = textureLoad(depthTex, vec2i(px), 0);
@@ -330,6 +421,13 @@ fn markPages(@builtin(global_invocation_id) gid: vec3u) {
     let lv = psParams.levels[level];
     let page = vec2i(floor(vec2f(dot(pos, lv.right.xyz), dot(pos, lv.up.xyz)) * lv.up.w));
     if (psInWindow(lv, page, n)) {
+      // Casters lie inside the scene bounds (the host fits them so), so a page
+      // outside the scene's light-space rect can hold no caster: it would be
+      // allocated and cleared for nothing (sky, water, terrain past the sim
+      // edge). A receiver there finds no page and is lit, as a cleared page
+      // would light it. The rect is padded by a page against f32 rounding at
+      // its edge; every coarser level's rect covers the same ground, so stop.
+      if (page.x < lv.scene.x - 1 || page.y < lv.scene.y - 1 || page.x > lv.scene.z + 1 || page.y > lv.scene.w + 1) { return; }
       let slot = psSlotIndex(level, page.x, page.y, u32(n));
       if (psRequests[slot] == 0u) { psRequests[slot] = 1u; }
       return;
