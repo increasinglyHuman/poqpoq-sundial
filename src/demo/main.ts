@@ -8,6 +8,7 @@ import { CascadedShadowGenerator } from "@babylonjs/core/Lights/Shadows/cascaded
 import { Color3, Color4 } from "@babylonjs/core/Maths/math.color";
 import { Matrix, Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
+import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import type { Mesh } from "@babylonjs/core/Meshes/mesh";
 import "@babylonjs/core"; // the demo pulls in every engine extension; the adapter does not need to
 import { SundialBabylon } from "../babylon/SundialBabylon";
@@ -91,6 +92,17 @@ async function main() {
 
   const treeCount = num("trees", 1400);
   const world = buildWorld(scene, treeCount);
+  // ?sea=1: a receiver-only sea far past the scene bounds, as World's water is.
+  // No caster can shadow it out there, so marking should request no pages for it.
+  if (q.get("sea") === "1") {
+    const sea = MeshBuilder.CreateGround("sea", { width: 1600, height: 1600 }, scene);
+    sea.position.y = -1;
+    const seaMat = new StandardMaterial("sea", scene);
+    seaMat.diffuseColor = new Color3(0.2, 0.35, 0.5);
+    sea.material = seaMat;
+    sea.receiveShadows = true;
+    world.materials.push(seaMat);
+  }
 
   // Depth prepass experiment. Babylon's needDepthPrePass draws the mesh first
   // with a shader variant that exits right after the alpha test, then the
@@ -145,6 +157,7 @@ async function main() {
   sundial.core.tuning.debugMode = q.get("debug") === "1" ? 1 : 0;
   sundial.core.tuning.lodBias = num("lodBias", 0);
   sundial.core.markStride = num("stride", 2);
+  sundial.core.markRotate = q.get("rotate") === "1";
   // ?hud=1: a second, HUD-style camera rendered after the world camera, as in
   // World (HUDSystem pushes hudCamera onto activeCameras, and the scene clears
   // depth and stencil automatically). Marking must keep reading WORLD depth.
