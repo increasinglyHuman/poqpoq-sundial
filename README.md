@@ -1,5 +1,7 @@
 <p align="center"><img src="docs/images/sundial-hero.jpg" alt="poqpoq Sundial" width="420"></p>
 
+<p align="center"><a href="https://www.npmjs.com/package/@poqpoq/sundial"><img src="https://img.shields.io/npm/v/@poqpoq/sundial" alt="npm"></a> <a href="https://github.com/increasinglyHuman/poqpoq-sundial/actions/workflows/ci.yml"><img src="https://github.com/increasinglyHuman/poqpoq-sundial/actions/workflows/ci.yml/badge.svg" alt="CI"></a> <img src="https://img.shields.io/npm/l/@poqpoq/sundial" alt="MIT"></p>
+
 # poqpoq Sundial — paged sun shadows for WebGPU
 
 Sundial is a virtual (paged) shadow map for one directional light, written in
@@ -86,9 +88,6 @@ is 0.03 ms on the RTX and 0.3–0.4 ms on the Xe-LPG.
 ```
 npm install @poqpoq/sundial @babylonjs/core
 ```
-
-(The npm release is days away. Until then, clone, `npm run build`, and depend
-on it by path: `"@poqpoq/sundial": "file:../poqpoq-sundial"`.)
 
 `@poqpoq/sundial` is an ES module with type declarations: the engine-agnostic
 core at `@poqpoq/sundial` and the Babylon.js adapter at
