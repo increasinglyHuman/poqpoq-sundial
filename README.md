@@ -275,10 +275,8 @@ Babylon team, awaiting merge:
   per mesh. Every cluster of a skinned mesh is culled against the whole
   mesh's pose box, so a large skinned mesh pairs each of its clusters with
   every page under the whole mesh; fine for avatars, costly for a big rig.
-  A skinned caster re-renders the pages under it every frame it animates.
-- **Known bug:** a receiver beyond the shadow depth range (a far sea past the
-  scene bounds) reads as shadowed. Keep `sceneMin`/`sceneMax` around
-  everything that receives. A clamp is next on the list.
+  An animating skinned caster re-composes the pages under it every frame,
+  like any moving dynamic caster (a full re-render with `staticCache: false`).
 - **Memory:** the pool is 64 MiB at the defaults (`poolSize`, `pageSize`),
   and the static cache doubles that to 128 MiB (`staticCache: false` saves it).
 - **Private Babylon API** (see Seams): a Babylon upgrade can break the adapter.
