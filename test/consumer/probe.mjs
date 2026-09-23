@@ -47,6 +47,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       // a moving dynamic caster's shadow follows it: moved by its parent, its own position, its thin buffer
       res.dynamicFollow.atA === "A" && res.dynamicFollow.viaParent === "B" && res.dynamicFollow.viaPosition === "A" &&
       res.dynamicFollow.thinA === "A" && res.dynamicFollow.thinB === "B" &&
+      // the receiver's min/max early-out changes no pixel, off or back on
+      res.minMax?.diffOff === 0 && res.minMax.diffBack === 0 &&
       // requests are per frame: empty sky requests fewer pages than the ground, and they come back
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
       // after dispose, a second instance took over the same materials and is paging
