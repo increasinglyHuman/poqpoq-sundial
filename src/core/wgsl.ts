@@ -47,7 +47,8 @@ struct PsParams {
   invViewProj: mat4x4f, // camera clip -> world, for the frame whose depth is being marked
   screen: vec4f,  // x = depth width, y = depth height, z = marking stride in pixels, w = 1 when depth is bound
   shade: vec4f,   // x = darkness: light left in full shadow (0 = black, 1 = no shadow), as Babylon's setDarkness;
-                  // y = 1 when psMinMax is live for every valid page (the receiver's PCF early-out)
+                  // y = 1 when psMinMax is live for every valid page (the receiver's PCF early-out);
+                  // z = 1 to rotate the page-marking sample through its stride cell each frame (markRotate); w unused
   levels: array<PsLevel, PS_MAX_LEVELS>,
   regions: array<vec4f>, // world-space invalidation boxes as (min, max) pairs
 };

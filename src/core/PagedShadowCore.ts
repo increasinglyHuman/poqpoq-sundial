@@ -9,6 +9,7 @@ import {
   C_REQUESTED,
   C_RESIDENT,
   COUNTER_COUNT,
+  COUNTER_WORDS,
   kernelsWGSL,
   markWGSL,
   workLayout,
@@ -111,6 +112,13 @@ export interface Stats {
   opaquePairs: number;
   alphaPairs: number;
   /**
+   * (cluster, page) pairs that did not fit in the pair lists (maxPairs each).
+   * The pages that lost them are not kept: they fall back a level and are
+   * rendered again the next frame. Non-zero every frame means maxPairs is too
+   * small for the scene.
+   */
+  droppedPairs: number;
+  /**
    * GPU time in ms of page marking, page management and page raster, while
    * `PagedShadowCore.profiling` is on; null while it is off, and without
    * timestamp-query. Marking includes any wait for the previous frame's
@@ -210,7 +218,7 @@ export class PagedShadowCore {
 
   stats: Stats = {
     frame: 0, requestedPages: 0, residentPages: 0, renderedPages: 0, deferredPages: 0, allocations: 0,
-    allocationFailures: 0, opaquePairs: 0, alphaPairs: 0, gpuMarkMs: null, gpuComputeMs: null, gpuRasterMs: null,
+    allocationFailures: 0, opaquePairs: 0, alphaPairs: 0, droppedPairs: 0, gpuMarkMs: null, gpuComputeMs: null, gpuRasterMs: null,
     levelRefreshes: 0, lastRefreshedLevel: -1,
   };
 
@@ -230,6 +238,8 @@ export class PagedShadowCore {
   private readonly workBuffer: GPUBuffer;
   private readonly counterBuffer: GPUBuffer;
   private readonly pairBuffer: GPUBuffer;
+  /** The cull's indirect dispatch args, copied out of the work buffer (see WorkLayout.dispatch). */
+  private readonly dispatchBuffer: GPUBuffer;
   private readonly alphaTexture: GPUTexture;
   /** Texels per side of each alpha layer. */
   readonly alphaSize: number;
@@ -337,6 +347,15 @@ export class PagedShadowCore {
   private depthBinding: { texture: GPUTexture; group: GPUBindGroup } | null = null;
   /** Depth pixels between samples when marking pages. */
   markStride = 2;
+  /**
+   * Rotate each marking sample through its markStride x markStride cell, one
+   * pixel per frame, so a sparser stride (3 or 4, cheaper on integrated GPUs)
+   * still reaches every pixel over a few frames. Pages stay resident between
+   * requests, but a page seen only by a few pixels may be requested only every
+   * few frames, and an invalidated page is re-rendered only on a frame that
+   * requests it (a coarser level stands in until then).
+   */
+  markRotate = false;
 
   /**
    * GPU pass timing. Off by default: with it on, every pass writes timestamps
@@ -385,12 +404,13 @@ export class PagedShadowCore {
     this.paramsBuffer = device.createBuffer({ label: "ps.params", size: PARAMS_BYTES, usage: STORAGE | COPY_DST | COPY_SRC });
     this.pageTableBuffer = device.createBuffer({ label: "ps.pageTable", size: this.slots * 8, usage: STORAGE | COPY_DST | COPY_SRC });
     this.requestBuffer = device.createBuffer({ label: "ps.requests", size: this.slots * 4, usage: STORAGE | COPY_DST });
-    this.counterBuffer = device.createBuffer({ label: "ps.counters", size: COUNTER_COUNT * 4, usage: STORAGE | COPY_DST | COPY_SRC });
+    this.counterBuffer = device.createBuffer({ label: "ps.counters", size: COUNTER_WORDS * 4, usage: STORAGE | COPY_DST | COPY_SRC });
     this.workBuffer = device.createBuffer({
       label: "ps.work",
       size: this.work.total * 4,
-      usage: STORAGE | COPY_DST | GPUBufferUsage.INDIRECT,
+      usage: STORAGE | COPY_DST | COPY_SRC | GPUBufferUsage.INDIRECT,
     });
+    this.dispatchBuffer = device.createBuffer({ label: "ps.dispatch", size: 16, usage: GPUBufferUsage.INDIRECT | COPY_DST });
     this.pairBuffer = device.createBuffer({ label: "ps.pairs", size: this.maxPairs * 2 * 8, usage: STORAGE });
     this.poolTexture = device.createTexture({
       label: "ps.pool",
@@ -434,9 +454,15 @@ export class PagedShadowCore {
     if (this.hasTimestamps) {
       this.querySet = device.createQuerySet({ type: "timestamp", count: 6 });
       this.queryResolve = device.createBuffer({ size: 48, usage: GPUBufferUsage.QUERY_RESOLVE | COPY_SRC });
-      for (const begin of [0, 2, 4]) {
-        this.passTimestamps.push({ querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: begin + 1 });
-      }
+      // Mark, paging, raster, and the end of the cull pass: paging spans two
+      // passes (see update), so it starts in one and ends in the other.
+      const q = this.querySet;
+      this.passTimestamps.push(
+        { querySet: q, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+        { querySet: q, beginningOfPassWriteIndex: 2 },
+        { querySet: q, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 },
+        { querySet: q, endOfPassWriteIndex: 3 },
+      );
     }
     for (let i = 0; i < 3; i++) {
       this.readbacks.push({
@@ -799,7 +825,7 @@ export class PagedShadowCore {
   /** Free every GPU resource. The core cannot be used afterwards. */
   dispose(): void {
     this.destroyContentBuffers(false);
-    for (const b of [this.paramsBuffer, this.pageTableBuffer, this.requestBuffer, this.counterBuffer, this.workBuffer, this.pairBuffer]) b.destroy();
+    for (const b of [this.paramsBuffer, this.pageTableBuffer, this.requestBuffer, this.counterBuffer, this.workBuffer, this.pairBuffer, this.dispatchBuffer]) b.destroy();
     for (const rb of this.readbacks) rb.buffer.destroy();
     this.queryResolve?.destroy();
     this.querySet?.destroy();
@@ -990,6 +1016,9 @@ export class PagedShadowCore {
       mp.dispatchWorkgroups(Math.ceil(tex.width / this.markStride / 8), Math.ceil(tex.height / this.markStride / 8));
       mp.end();
     }
+    // Paging is two passes around a 12-byte copy: the cull is dispatched
+    // indirectly from args finalizeRenderList writes into the work buffer,
+    // which cannot be indirect while it is bound writable (see WorkLayout.dispatch).
     const cp = enc.beginComputePass({ label: "ps.paging", timestampWrites: timed?.[1] });
     cp.setBindGroup(0, this.computeGroup);
     cp.setPipeline(k.updateSlots);
@@ -1012,11 +1041,18 @@ export class PagedShadowCore {
     }
     cp.setPipeline(k.finalizeRenderList);
     cp.dispatchWorkgroups(1);
-    cp.setPipeline(k.cullClusters);
-    cp.dispatchWorkgroups(wg(this.clusterInstanceCount));
-    cp.setPipeline(k.finalizeDraws);
-    cp.dispatchWorkgroups(1);
     cp.end();
+    enc.copyBufferToBuffer(this.workBuffer, this.work.dispatch * 4, this.dispatchBuffer, 0, 12);
+    const cull = enc.beginComputePass({ label: "ps.cull", timestampWrites: timed?.[3] });
+    cull.setBindGroup(0, this.computeGroup);
+    // Zero workgroups when no page renders this frame (the common static case).
+    cull.setPipeline(k.cullClusters);
+    cull.dispatchWorkgroupsIndirect(this.dispatchBuffer, 0);
+    // Always runs: it zeroes the caster draws when the cull did not run (the
+    // pair counters were cleared), and it is one thread.
+    cull.setPipeline(k.finalizeDraws);
+    cull.dispatchWorkgroups(1);
+    cull.end();
     if (!depth) enc.clearBuffer(this.requestBuffer);
 
     const rp = enc.beginRenderPass({
@@ -1180,7 +1216,8 @@ export class PagedShadowCore {
     } else {
       f[36] = 0; f[37] = 0; f[38] = this.markStride; f[39] = 0;
     }
-    f[SHADE_WORD] = Math.min(1, Math.max(0, t.darkness)); f[SHADE_WORD + 1] = this.minMaxLive ? 1 : 0; f[SHADE_WORD + 2] = 0; f[SHADE_WORD + 3] = 0;
+    f[SHADE_WORD] = Math.min(1, Math.max(0, t.darkness)); f[SHADE_WORD + 1] = this.minMaxLive ? 1 : 0;
+    f[SHADE_WORD + 2] = this.markRotate && this.markStride > 1 ? 1 : 0; f[SHADE_WORD + 3] = 0;
 
     const lo = this.sceneMin;
     const hi = this.sceneMax;
@@ -1330,6 +1367,7 @@ export class PagedShadowCore {
         s.allocationFailures = c[C_ALLOC_FAIL];
         s.opaquePairs = c[C_OPAQUE_PAIRS];
         s.alphaPairs = c[C_ALPHA_PAIRS];
+        s.droppedPairs = Math.max(0, c[C_OPAQUE_PAIRS] - this.maxPairs) + Math.max(0, c[C_ALPHA_PAIRS] - this.maxPairs);
         if (rb.timed && this.querySet) {
           const ts = new BigUint64Array(data, COUNTER_COUNT * 4, 6);
           const ms = (a: bigint, b: bigint) => (b > a ? Number(b - a) / 1e6 : 0);
