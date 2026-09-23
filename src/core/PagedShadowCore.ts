@@ -4,6 +4,10 @@ import {
   C_ALLOC_FAIL,
   C_ALPHA_PAIRS,
   C_DEFERRED,
+  C_DYN_ALPHA_PAIRS,
+  C_DYN_DEFERRED,
+  C_DYN_OPAQUE_PAIRS,
+  C_DYN_PAGES,
   C_OPAQUE_PAIRS,
   C_RENDER,
   C_REQUESTED,
@@ -26,6 +30,16 @@ import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, MINMAX_TILE, PARAMS_BYTES, PARAMS
 //   -> render list -> cluster x page cull -> one clear draw + two caster draws
 // The CPU never learns which pages are resident; it only decides when a level's
 // light basis has drifted far enough to be re-rendered.
+//
+// With the static cache (the default), static casters render into a second
+// pool, staticPool, and the pool receivers read is composed per page: the
+// page's static depth copied in, then the dynamic casters drawn over it. A
+// moving dynamic caster only marks the pages it crossed stale; those are
+// re-composed from staticPool (a quad per page) and get the few dynamic
+// casters redrawn, instead of re-rendering every static caster on them:
+//   ... -> mark stale -> invalidate -> allocate -> static list -> dynamic list
+//   -> dynamic cull -> static cull
+//   -> [staticPool] clear + static casters -> [pool] composite + dynamic casters
 
 export type Vec3 = [number, number, number];
 
@@ -45,6 +59,20 @@ export interface PagedShadowOptions {
   finestPageWorldSize?: number;
   /** Most pages re-rendered in one frame; the rest fall back a level for a frame. */
   renderBudget?: number;
+  /**
+   * Keep each page's static-only depth in a second pool (default true), so
+   * that dynamic casters (addInstances(..., dynamic = true)) moving re-draw
+   * only themselves over a copy of it, not every static caster on the pages
+   * they cross. Costs a second pool texture (poolSize² × 4 bytes: 64 MiB at
+   * 4096). false: one pool, and a moving dynamic caster re-renders every page
+   * its old and new bounds touch, as a static edit does.
+   */
+  staticCache?: boolean;
+  /**
+   * With the static cache: most pages re-composed for dynamic casters in one
+   * frame (default 64); the rest fall back a level for a frame.
+   */
+  dynamicBudget?: number;
   /** Capacity of each (cluster, page) pair list. */
   maxPairs?: number;
   /** Triangles per cluster. */
@@ -84,7 +112,10 @@ export interface Tuning {
   debugMode: number;
   /** Sun-angle tolerance of level 0 in degrees; level k tolerates 2^k times more. */
   bandDegrees: number;
+  /** Static page renders per frame (every page, without the static cache). */
   renderBudget: number;
+  /** Static cache only: pages re-composed for dynamic casters per frame. */
+  dynamicBudget: number;
   /**
    * Light left in full shadow: 0 = black, 1 = no visible shadow. Same meaning
    * as Babylon's ShadowGenerator.setDarkness, so a host can feed it the value
@@ -105,8 +136,21 @@ export interface Stats {
   frame: number;
   requestedPages: number;
   residentPages: number;
+  /** Pages rendered from scratch this frame: with the static cache, the static casters into staticPool. */
   renderedPages: number;
+  /** Pages the render budget pushed to a later frame. */
   deferredPages: number;
+  /**
+   * Static cache: pages re-composed for dynamic casters only (their static
+   * depth copied back, the dynamic casters redrawn), and the ones
+   * dynamicBudget pushed to a later frame. 0 without the cache.
+   */
+  dynamicPages: number;
+  dynamicDeferred: number;
+  /** Static cache: pages composited into the live pool (renderedPages + dynamicPages). 0 without the cache. */
+  compositedPages: number;
+  /** Static cache: (dynamic cluster, page) pairs drawn, opaque and alpha together. */
+  dynamicPairs: number;
   allocations: number;
   allocationFailures: number;
   opaquePairs: number;
@@ -191,6 +235,8 @@ export class PagedShadowCore {
   readonly maxPairs: number;
   readonly useClipDistances: boolean;
   readonly hasTimestamps: boolean;
+  /** Static casters are cached in staticPool (see PagedShadowOptions.staticCache). */
+  readonly staticCache: boolean;
 
   readonly tuning: Tuning = {
     lodBias: 0,
@@ -199,6 +245,7 @@ export class PagedShadowCore {
     debugMode: 0,
     bandDegrees: 0.05,
     renderBudget: 96,
+    dynamicBudget: 64,
     darkness: 0,
     minMaxEarlyOut: true,
   };
@@ -217,7 +264,8 @@ export class PagedShadowCore {
   readonly minMaxTexture: GPUTexture;
 
   stats: Stats = {
-    frame: 0, requestedPages: 0, residentPages: 0, renderedPages: 0, deferredPages: 0, allocations: 0,
+    frame: 0, requestedPages: 0, residentPages: 0, renderedPages: 0, deferredPages: 0,
+    dynamicPages: 0, dynamicDeferred: 0, compositedPages: 0, dynamicPairs: 0, allocations: 0,
     allocationFailures: 0, opaquePairs: 0, alphaPairs: 0, droppedPairs: 0, gpuMarkMs: null, gpuComputeMs: null, gpuRasterMs: null,
     levelRefreshes: 0, lastRefreshedLevel: -1,
   };
@@ -233,6 +281,22 @@ export class PagedShadowCore {
   private depthCentre: Vec3 = [0, 0, 0];
   private depthRadius = 0;
   private readonly renderBudgetMax: number;
+  /** Most dynamic-list entries (0 without the static cache): the render list holds both lists. */
+  private readonly dynamicBudgetMax: number;
+  /** Static-only depth of every page, laid out as the pool; null without the static cache. */
+  private readonly staticPool: GPUTexture | null = null;
+  private readonly staticView: GPUTextureView | null = null;
+  /** The composite's staticPool binding (group 1 of the live-pool pass). */
+  private compositeGroup: GPUBindGroup | null = null;
+  private compositePipeline: GPURenderPipeline | null = null;
+  private opaqueDynamicPipeline: GPURenderPipeline | null = null;
+  private alphaDynamicPipeline: GPURenderPipeline | null = null;
+  /**
+   * The first dynamic cluster instance: with the static cache, build() puts
+   * the cluster instances of dynamic groups last. Equal to the cluster
+   * instance count without the cache or without dynamic casters.
+   */
+  private dynamicFirst = 0;
   private readonly slots: number;
   private readonly work: WorkLayout;
   private readonly workBuffer: GPUBuffer;
@@ -319,6 +383,14 @@ export class PagedShadowCore {
   private instanceMatrices = new Float32Array(12 * 256);
   private instanceGeometry: number[] = [];
   private regions: number[] = [];
+  /**
+   * Static cache: the old and new bounds of dynamic instances that moved.
+   * They mark pages stale (re-composed, dynamic casters redrawn), not invalid.
+   * Uploaded after `regions`; each list gets half of MAX_REGIONS.
+   */
+  private dynamicRegions: number[] = [];
+  /** Dynamic regions uploaded by this frame's writeParams. */
+  private frameDynamicRegions = 0;
   private dirtyInstances = new Set<number>();
   /** Scratch for uploadDirtyInstances: the dirty instances in order, and their rows as f32. */
   private readonly dirtyOrder: number[] = [];
@@ -394,9 +466,12 @@ export class PagedShadowCore {
     this.clusterTris = options.clusterTris ?? 64;
     this.maxPairs = options.maxPairs ?? 1 << 19;
     this.renderBudgetMax = 1024;
+    this.staticCache = options.staticCache !== false;
+    this.dynamicBudgetMax = this.staticCache ? 1024 : 0;
     this.tuning.renderBudget = options.renderBudget ?? this.tuning.renderBudget;
+    this.tuning.dynamicBudget = options.dynamicBudget ?? this.tuning.dynamicBudget;
     this.slots = this.levelCount * this.pagesPerSide * this.pagesPerSide;
-    this.work = workLayout(this.slots, this.pageCount, this.renderBudgetMax);
+    this.work = workLayout(this.slots, this.pageCount, this.renderBudgetMax + this.dynamicBudgetMax);
     this.useClipDistances = device.features.has("clip-distances") && options.clipDistances !== false;
     this.hasTimestamps = device.features.has("timestamp-query");
 
@@ -419,6 +494,15 @@ export class PagedShadowCore {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
     this.poolView = this.poolTexture.createView();
+    if (this.staticCache) {
+      this.staticPool = device.createTexture({
+        label: "ps.staticPool",
+        size: [this.poolSize, this.poolSize],
+        format: "depth32float",
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.staticView = this.staticPool.createView();
+    }
     this.minMaxSupported = this.pageSize % MINMAX_TILE === 0;
     const mm = this.minMaxSupported ? this.poolSize / MINMAX_TILE : 1;
     this.minMaxTexture = device.createTexture({
@@ -444,24 +528,28 @@ export class PagedShadowCore {
       addressModeV: "repeat",
     });
 
-    // Draw-arg constants that never change: vertex counts and zero offsets.
-    const ind = new Uint32Array(12);
-    ind[0] = 6;
-    ind[4] = this.clusterTris * 3;
-    ind[8] = this.clusterTris * 3;
+    // Draw-arg constants that never change: vertex counts and zero offsets
+    // (see WorkLayout.indirect for the six draws).
+    const ind = new Uint32Array(24);
+    ind[0] = ind[12] = 6;
+    ind[4] = ind[8] = ind[16] = ind[20] = this.clusterTris * 3;
     device.queue.writeBuffer(this.workBuffer, this.work.indirect * 4, ind);
 
     if (this.hasTimestamps) {
       this.querySet = device.createQuerySet({ type: "timestamp", count: 6 });
       this.queryResolve = device.createBuffer({ size: 48, usage: GPUBufferUsage.QUERY_RESOLVE | COPY_SRC });
       // Mark, paging, raster, and the end of the cull pass: paging spans two
-      // passes (see update), so it starts in one and ends in the other.
+      // passes (see update), so it starts in one and ends in the other. With
+      // the static cache the raster is two passes too (the start of the
+      // static one, the end of the live one).
       const q = this.querySet;
       this.passTimestamps.push(
         { querySet: q, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
         { querySet: q, beginningOfPassWriteIndex: 2 },
         { querySet: q, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 },
         { querySet: q, endOfPassWriteIndex: 3 },
+        { querySet: q, beginningOfPassWriteIndex: 4 },
+        { querySet: q, endOfPassWriteIndex: 5 },
       );
     }
     for (let i = 0; i < 3; i++) {
@@ -587,7 +675,13 @@ export class PagedShadowCore {
       }
     }
     const box = hadBefore ? before : hasAfter ? after : null;
-    if (box) this.invalidateRange(box[0], box[1], box[2], box[3], box[4], box[5]);
+    if (box) {
+      // With the static cache a dynamic caster's motion leaves the static
+      // depth under it good: its pages are re-composed, not re-rendered.
+      if (group.dynamic && this.staticCache) {
+        this.queueRegion(this.dynamicRegions, MAX_REGIONS / 2, box[0], box[1], box[2], box[3], box[4], box[5]);
+      } else this.invalidateRange(box[0], box[1], box[2], box[3], box[4], box[5]);
+    }
     this.dirtyInstances.add(inst);
   }
 
@@ -598,12 +692,17 @@ export class PagedShadowCore {
 
   /** invalidateBox on six numbers, so per-frame callers need no arrays. */
   private invalidateRange(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): void {
-    const n = this.regions.length / 8;
-    if (n >= MAX_REGIONS) {
+    // With the static cache the dynamic regions get the other half of the params' region array.
+    this.queueRegion(this.regions, this.staticCache ? MAX_REGIONS / 2 : MAX_REGIONS, x0, y0, z0, x1, y1, z1);
+  }
+
+  /** Queue a world box on a region list of at most `cap` boxes. */
+  private queueRegion(r: number[], cap: number, x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): void {
+    const n = r.length / 8;
+    if (n >= cap) {
       // Full: grow the queued box this one enlarges least, instead of
       // re-rendering every page. Many movers in one frame are usually close
       // together (a linkset, a vehicle), so the merged boxes stay local.
-      const r = this.regions;
       let best = 0;
       let bestGrowth = Infinity;
       for (let i = 0; i < n; i++) {
@@ -627,7 +726,7 @@ export class PagedShadowCore {
       r[best + 6] = Math.max(r[best + 6], z1);
       return;
     }
-    this.regions.push(x0, y0, z0, 0, x1, y1, z1, 0);
+    r.push(x0, y0, z0, 0, x1, y1, z1, 0);
   }
 
   invalidateAll(): void {
@@ -775,19 +874,31 @@ export class PagedShadowCore {
     this.vertexBuffer = vertexBuffer;
     this.indexBuffer = indexBuffer;
 
-    // Cluster instances: every cluster of an instance's geometry.
+    // Cluster instances: every cluster of an instance's geometry. With the
+    // static cache, dynamic groups' come last, so the static and dynamic culls
+    // each run over a contiguous range.
     let pairs = 0;
     for (let inst = 0; inst < this.instanceGeometry.length; inst++) pairs += this.geometries[this.instanceGeometry[inst]].clusters.length;
     const ci = new Uint32Array(pairs * 2);
     let w = 0;
-    for (let inst = 0; inst < this.instanceGeometry.length; inst++) {
-      const g = this.instanceGeometry[inst];
-      const start = geomClusterStart[g];
-      const n = this.geometries[g].clusters.length;
-      for (let k = 0; k < n; k++) {
-        ci[w++] = start + k;
-        ci[w++] = inst;
+    const emit = (group: InstanceGroup) => {
+      const start = geomClusterStart[group.geometry];
+      const n = this.geometries[group.geometry].clusters.length;
+      for (let inst = group.first; inst < group.first + group.count; inst++) {
+        for (let k = 0; k < n; k++) {
+          ci[w++] = start + k;
+          ci[w++] = inst;
+        }
       }
+    };
+    if (this.staticCache) {
+      for (const g of this.groups) if (!g.dynamic) emit(g);
+      this.dynamicFirst = w / 2;
+      for (const g of this.groups) if (g.dynamic) emit(g);
+    } else {
+      // Groups are registered in instance order, so this is instance order.
+      for (const g of this.groups) emit(g);
+      this.dynamicFirst = pairs;
     }
     this.clusterInstanceCount = pairs;
 
@@ -830,6 +941,7 @@ export class PagedShadowCore {
     this.queryResolve?.destroy();
     this.querySet?.destroy();
     this.poolTexture.destroy();
+    this.staticPool?.destroy();
     this.minMaxTexture.destroy();
     this.alphaTexture.destroy();
     this.geometryCache.clear();
@@ -956,6 +1068,8 @@ export class PagedShadowCore {
       instances: this.instanceGeometry.length,
       clusters: this.clusterCount,
       clusterInstances: this.clusterInstanceCount,
+      /** Cluster instances of dynamic groups (0 without the static cache: they are culled with the rest). */
+      dynamicClusterInstances: this.clusterInstanceCount - this.dynamicFirst,
       triangles: this.geometries.reduce((s, g) => s + g.indices.length / 3, 0),
     };
   }
@@ -1023,6 +1137,12 @@ export class PagedShadowCore {
     cp.setBindGroup(0, this.computeGroup);
     cp.setPipeline(k.updateSlots);
     cp.dispatchWorkgroups(wg(this.slots));
+    // Stale before invalid: a page both touch needs the full render (K2d).
+    const dynamicRegionCount = this.frameDynamicRegions;
+    if (dynamicRegionCount > 0) {
+      cp.setPipeline(k.markDynamicRegions);
+      cp.dispatchWorkgroups(wg(dynamicRegionCount * this.levelCount));
+    }
     if (regionCount > 0) {
       cp.setPipeline(k.invalidateRegions);
       cp.dispatchWorkgroups(wg(regionCount * this.levelCount));
@@ -1041,11 +1161,30 @@ export class PagedShadowCore {
     }
     cp.setPipeline(k.finalizeRenderList);
     cp.dispatchWorkgroups(1);
+    if (this.staticCache) {
+      // The dynamic list follows the static one (K5d), coarsest level first too.
+      cp.setPipeline(k.buildDynamicListCoarse);
+      cp.dispatchWorkgroups(wg(perLevel));
+      if (this.levelCount > 1) {
+        cp.setPipeline(k.buildDynamicListFine);
+        cp.dispatchWorkgroups(wg(this.slots - perLevel));
+      }
+      cp.setPipeline(k.finalizeDynamicList);
+      cp.dispatchWorkgroups(1);
+    }
     cp.end();
     enc.copyBufferToBuffer(this.workBuffer, this.work.dispatch * 4, this.dispatchBuffer, 0, 12);
     const cull = enc.beginComputePass({ label: "ps.cull", timestampWrites: timed?.[3] });
     cull.setBindGroup(0, this.computeGroup);
-    // Zero workgroups when no page renders this frame (the common static case).
+    // Dynamic cluster instances first: their pairs' count bounds the static
+    // ones (both share each pair list). Few threads, each leaving at once on
+    // a frame that draws no page.
+    const dynamicClusterInstances = this.clusterInstanceCount - this.dynamicFirst;
+    if (dynamicClusterInstances > 0) {
+      cull.setPipeline(k.cullDynamicClusters);
+      cull.dispatchWorkgroups(wg(dynamicClusterInstances));
+    }
+    // Zero workgroups when no static page renders this frame (the common static case).
     cull.setPipeline(k.cullClusters);
     cull.dispatchWorkgroupsIndirect(this.dispatchBuffer, 0);
     // Always runs: it zeroes the caster draws when the cull did not run (the
@@ -1055,19 +1194,21 @@ export class PagedShadowCore {
     cull.end();
     if (!depth) enc.clearBuffer(this.requestBuffer);
 
+    const indirect = this.work.indirect * 4;
+    const loadOp: GPULoadOp = this.started ? "load" : "clear";
+    // Static casters: into staticPool with the cache, into the pool without it.
     const rp = enc.beginRenderPass({
       label: "ps.raster",
       colorAttachments: [],
       depthStencilAttachment: {
-        view: this.poolView,
-        depthLoadOp: this.started ? "load" : "clear",
+        view: this.staticView ?? this.poolView,
+        depthLoadOp: loadOp,
         depthClearValue: 1,
         depthStoreOp: "store",
       },
-      timestampWrites: timed?.[2],
+      timestampWrites: timed?.[this.staticCache ? 4 : 2],
     });
     rp.setBindGroup(0, this.rasterGroup);
-    const indirect = this.work.indirect * 4;
     rp.setPipeline(this.clearPipeline);
     rp.drawIndirect(this.workBuffer, indirect);
     rp.setPipeline(this.opaquePipeline);
@@ -1075,15 +1216,40 @@ export class PagedShadowCore {
     rp.setPipeline(this.alphaPipeline);
     rp.drawIndirect(this.workBuffer, indirect + 32);
     rp.end();
-    // Min/max of every page just rendered, in its own pass after the raster
-    // so the pool reads see this frame's depth. Pages not rendered this frame
-    // keep both their depth and their min/max, so the atlas stays exact.
+    if (this.staticCache) {
+      // The live pool: every page drawn this frame (static and dynamic list)
+      // gets its static depth copied in, then its dynamic casters drawn over
+      // it. A depth texture's sub-rectangle cannot be copied, hence a quad per
+      // page writing frag_depth. staticPool is bound only here, never in the
+      // pass that renders into it.
+      const lp = enc.beginRenderPass({
+        label: "ps.rasterLive",
+        colorAttachments: [],
+        depthStencilAttachment: { view: this.poolView, depthLoadOp: loadOp, depthClearValue: 1, depthStoreOp: "store" },
+        timestampWrites: timed?.[5],
+      });
+      lp.setBindGroup(0, this.rasterGroup);
+      lp.setBindGroup(1, this.compositeGroup!);
+      lp.setPipeline(this.compositePipeline!);
+      lp.drawIndirect(this.workBuffer, indirect + 48);
+      lp.setPipeline(this.opaqueDynamicPipeline!);
+      lp.drawIndirect(this.workBuffer, indirect + 64);
+      lp.setPipeline(this.alphaDynamicPipeline!);
+      lp.drawIndirect(this.workBuffer, indirect + 80);
+      lp.end();
+    }
+    // Min/max of every page just drawn, in its own pass after the raster so
+    // the pool reads see this frame's depth. Pages not drawn this frame keep
+    // both their depth and their min/max, so the atlas stays exact.
     if (minMax) {
       const mp = enc.beginComputePass({ label: "ps.minMax" });
       mp.setPipeline(this.minMaxPipeline);
       mp.setBindGroup(0, this.minMaxGroup);
       const blocks = Math.ceil(this.pageSize / MINMAX_TILE / 8);
-      mp.dispatchWorkgroups(blocks, blocks, Math.min(this.tuning.renderBudget, this.renderBudgetMax));
+      const pages =
+        Math.min(this.tuning.renderBudget, this.renderBudgetMax) +
+        (this.staticCache ? Math.min(this.tuning.dynamicBudget, this.dynamicBudgetMax) : 0);
+      mp.dispatchWorkgroups(blocks, blocks, pages);
       mp.end();
     }
     this.started = true;
@@ -1251,11 +1417,24 @@ export class PagedShadowCore {
       u[base + 24] = lv.invalidate ? 1 : 0; u[base + 25] = 0; u[base + 26] = 0; u[base + 27] = 0;
       lv.invalidate = false;
     }
+    // The dynamic regions follow the static ones. Their count, the dynamic
+    // budget and the first dynamic cluster instance ride in levels[0].flags.yzw
+    // (unused otherwise; see dynRegionCount() in kernels.ts).
+    const dynamicCount = Math.min(MAX_REGIONS - regionCount, this.dynamicRegions.length / 8);
+    const l0 = LEVELS_WORD + 24;
+    u[l0 + 1] = dynamicCount;
+    u[l0 + 2] = Math.min(this.tuning.dynamicBudget, this.dynamicBudgetMax);
+    u[l0 + 3] = this.dynamicFirst;
     const regions = this.regions;
     const r0 = PARAMS_HEADER_BYTES / 4;
     for (let k = 0, n = regionCount * 8; k < n; k++) f[r0 + k] = regions[k];
     regions.length = 0;
-    this.device.queue.writeBuffer(this.paramsBuffer, 0, this.params, 0, PARAMS_HEADER_BYTES + regionCount * 32);
+    const dyn = this.dynamicRegions;
+    const d0 = r0 + regionCount * 8;
+    for (let k = 0, n = dynamicCount * 8; k < n; k++) f[d0 + k] = dyn[k];
+    dyn.length = 0;
+    this.frameDynamicRegions = dynamicCount;
+    this.device.queue.writeBuffer(this.paramsBuffer, 0, this.params, 0, PARAMS_HEADER_BYTES + (regionCount + dynamicCount) * 32);
     return regionCount;
   }
 
@@ -1365,9 +1544,16 @@ export class PagedShadowCore {
         s.deferredPages = c[C_DEFERRED];
         s.allocations = c[C_ALLOC];
         s.allocationFailures = c[C_ALLOC_FAIL];
+        s.dynamicPages = Math.min(c[C_DYN_PAGES], this.tuning.dynamicBudget);
+        s.dynamicDeferred = c[C_DYN_DEFERRED];
+        s.compositedPages = this.staticCache ? s.renderedPages + s.dynamicPages : 0;
         s.opaquePairs = c[C_OPAQUE_PAIRS];
         s.alphaPairs = c[C_ALPHA_PAIRS];
-        s.droppedPairs = Math.max(0, c[C_OPAQUE_PAIRS] - this.maxPairs) + Math.max(0, c[C_ALPHA_PAIRS] - this.maxPairs);
+        s.dynamicPairs = c[C_DYN_OPAQUE_PAIRS] + c[C_DYN_ALPHA_PAIRS];
+        // Static and dynamic pairs share each list (from either end).
+        s.droppedPairs =
+          Math.max(0, c[C_OPAQUE_PAIRS] + c[C_DYN_OPAQUE_PAIRS] - this.maxPairs) +
+          Math.max(0, c[C_ALPHA_PAIRS] + c[C_DYN_ALPHA_PAIRS] - this.maxPairs);
         if (rb.timed && this.querySet) {
           const ts = new BigUint64Array(data, COUNTER_COUNT * 4, 6);
           const ms = (a: bigint, b: bigint) => (b > a ? Number(b - a) / 1e6 : 0);
@@ -1446,6 +1632,9 @@ export class PagedShadowCore {
     for (const entryPoint of [
       "updateSlots", "invalidateRegions", "collectPhys", "allocate",
       "buildRenderListCoarse", "buildRenderListFine", "finalizeRenderList", "cullClusters", "finalizeDraws",
+      ...(this.staticCache
+        ? ["markDynamicRegions", "buildDynamicListCoarse", "buildDynamicListFine", "finalizeDynamicList", "cullDynamicClusters"]
+        : []),
     ]) {
       this.kernels[entryPoint] = d.createComputePipeline({
         label: `ps.${entryPoint}`,
@@ -1489,6 +1678,44 @@ export class PagedShadowCore {
       primitive: { topology: "triangle-list", cullMode: "none" },
       depthStencil: depth("less", true),
     });
+
+    if (this.staticPool) {
+      // The live pool's pass: the composite reads staticPool (group 1), and
+      // the dynamic casters draw as the static ones do, from the other end of
+      // each pair list.
+      const compositeLayout = d.createBindGroupLayout({
+        label: "ps.compositeLayout",
+        entries: [{ binding: 0, visibility: F, texture: { sampleType: "depth" } }],
+      });
+      this.compositeGroup = d.createBindGroup({
+        layout: compositeLayout,
+        entries: [{ binding: 0, resource: this.staticPool.createView({ aspect: "depth-only" }) }],
+      });
+      this.compositePipeline = d.createRenderPipeline({
+        label: "ps.composite",
+        layout: d.createPipelineLayout({ bindGroupLayouts: [this.rasterLayout, compositeLayout] }),
+        vertex: { module: rasterModule, entryPoint: "clearVS" },
+        fragment: { module: rasterModule, entryPoint: "compositeFS", targets: [] },
+        primitive: { topology: "triangle-list" },
+        depthStencil: depth("always", false),
+      });
+      this.opaqueDynamicPipeline = d.createRenderPipeline({
+        label: "ps.opaqueDynamic",
+        layout: rasterPL,
+        vertex: { module: rasterModule, entryPoint: "opaqueDynamicVS" },
+        fragment: this.useClipDistances ? undefined : { module: rasterModule, entryPoint: "opaqueFS", targets: [] },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+        depthStencil: depth("less", true),
+      });
+      this.alphaDynamicPipeline = d.createRenderPipeline({
+        label: "ps.alphaDynamic",
+        layout: rasterPL,
+        vertex: { module: rasterModule, entryPoint: "alphaDynamicVS" },
+        fragment: { module: rasterModule, entryPoint: "alphaFS", targets: [] },
+        primitive: { topology: "triangle-list", cullMode: "none" },
+        depthStencil: depth("less", true),
+      });
+    }
   }
 }
 

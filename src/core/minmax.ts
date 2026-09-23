@@ -54,14 +54,16 @@ const SIDE: u32 = ${side}u;
 var<workgroup> tiles: array<vec2f, ${side * side}>;
 
 // x, y: 8x8 blocks of output texels in the page; z: render-list index. The
-// host dispatches z for the whole render budget; indices past this frame's
-// render count (the clear draw's instance count) leave at once.
+// host dispatches z for the whole render budget (static plus dynamic with the
+// static cache); indices past this frame's page count (the composite draw's
+// instance count, which finalizeRenderList sets without the cache too) leave
+// at once.
 @compute @workgroup_size(8, 8)
 fn buildMinMax(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u,
                @builtin(local_invocation_index) li: u32) {
   // Read-only storage at a workgroup-uniform index: uniform, so the early
   // return keeps the barrier below in uniform control flow.
-  if (wg.z >= work[W_INDIRECT + 1u]) { return; }
+  if (wg.z >= work[W_INDIRECT + 13u]) { return; }
   let slot = work[W_RENDER_LIST + wg.z];
   let phys = psPageTable[slot].x & PS_PHYS_MASK;
   let s = i32(psParams.pool.z);
