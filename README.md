@@ -106,6 +106,7 @@ if (SundialBabylon.isSupported(engine)) {
   sundial.addCaster(leaves);                                        // alpha-tested: the mask is read from its material
   sundial.addCaster(windmill, { dynamic: true });                   // re-read every frame
   sundial.addCaster(swarm, { dynamic: true, capacity: 64 });        // thin-instance count may vary up to 64
+  sundial.addCaster(avatar, { dynamic: true });                     // has a skeleton: casts its skinned pose
   sundial.addReceivers(materials);                                  // meshes also need receiveShadows
   sundial.start();
 }
@@ -125,6 +126,13 @@ if (SundialBabylon.isSupported(engine)) {
   back a level for a frame. The cache costs a second pool (64 MiB at the
   defaults); `staticCache: false` drops it, and a moving dynamic caster then
   re-renders the pages under its old and new bounds, as a static edit does.
+- **Skinned casters.** A dynamic caster with a skeleton (and bone indices and
+  weights) casts its current pose, skinned on the GPU in the caster vertex
+  stage from `skeleton.getTransformMatrices(mesh)` each frame, whether or not
+  the skeleton stores its matrices in a texture. Up to 8 influences (both of
+  Babylon's sets) and 256 bones. The shadow's bounds come from per-bone
+  radii, not from skinning vertices on the CPU. A static caster with a
+  skeleton casts its bind pose, as before.
 - **Moving a few static instances.** `updateCasterMatrices(mesh, matrices)`
   rewrites only the instances whose matrices changed and re-renders only the
   pages under their old and new footprints. It returns `false` if the instance
@@ -146,12 +154,13 @@ if (SundialBabylon.isSupported(engine)) {
   timestamp resolve every frame, so it is off by default.
 
 A `ShadowGenerator` can share the light for casters Sundial doesn't cover
-(poqpoq World keeps a small CSM for skinned avatars). The receiver folds its
+(morph targets, for instance). The receiver folds its
 factor into Babylon's with `min()`, so overlapping shadows never darken twice.
 Just don't give both the same casters.
 
 **The core without Babylon.** `PagedShadowCore` takes a `GPUDevice`, geometry
-(positions, indices, optional UVs and alpha layer), instance matrices, and per
+(positions, indices, optional UVs and alpha layer, optional skin influences),
+instance matrices (`setSkinPose` poses a skinned instance), and per
 frame the eye, sun direction, and the camera's depth texture with its
 inverse view-projection matrix. It exports its receiver WGSL (`COMMON_WGSL`,
 `RECEIVER_WGSL`) for your own materials. The Babylon adapter is the worked
@@ -260,9 +269,13 @@ Babylon team, awaiting merge:
 - **One directional light.** Point and spot lights are out of scope.
 - **Receivers:** StandardMaterial and PBRMaterial in WGSL. Node materials and
   custom shaders need the exported WGSL wired in by hand.
-- **Skinned meshes don't cast yet.** Skinning in the caster vertex shader is
-  planned; until then keep a small CSM for avatars (the `min()` fold above
-  makes the two coexist).
+- **Skinned casters:** linear blend skinning only. Morph targets are not
+  applied (the shadow has the unmorphed shape), and neither is CPU skinning
+  (`computeBonesUsingShaders = false`). At most 8 influences and 256 bones
+  per mesh. Every cluster of a skinned mesh is culled against the whole
+  mesh's pose box, so a large skinned mesh pairs each of its clusters with
+  every page under the whole mesh; fine for avatars, costly for a big rig.
+  A skinned caster re-renders the pages under it every frame it animates.
 - **Known bug:** a receiver beyond the shadow depth range (a far sea past the
   scene bounds) reads as shadowed. Keep `sceneMin`/`sceneMax` around
   everything that receives. A clamp is next on the list.
@@ -271,7 +284,7 @@ Babylon team, awaiting merge:
 - **Private Babylon API** (see Seams): a Babylon upgrade can break the adapter.
   Babylon 9.17.1 is tested.
 
-Planned: skinned casters, level cross-fade, a three.js adapter, and a
+Planned: level cross-fade, a three.js adapter, and a
 screen-space shadow mask as an engine-agnostic receiver.
 
 ## Development
