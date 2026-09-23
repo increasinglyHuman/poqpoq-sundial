@@ -110,6 +110,8 @@ async function main() {
   // ?skin8=1 spreads their weights over 8 influences (same pose).
   const skinned = buildCharacters(scene, num("skinned", 0), world.heightAt, q.get("skin8") === "1");
   if (skinned.characters.length) world.materials.push(skinned.material);
+  // ?bonetex=0: bone matrices in uniforms instead of Babylon's default texture.
+  if (q.get("bonetex") === "0") for (const c of skinned.characters) c.mesh.skeleton!.useTextureToStoreBoneMatrices = false;
   const skinT = q.has("skinT") ? num("skinT", 0) : null;
   for (const c of skinned.characters) c.update(skinT ?? 0);
 
