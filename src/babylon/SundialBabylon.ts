@@ -2,6 +2,7 @@ import type { Scene } from "@babylonjs/core/scene";
 import type { Camera } from "@babylonjs/core/Cameras/camera";
 import type { DirectionalLight } from "@babylonjs/core/Lights/directionalLight";
 import type { Mesh } from "@babylonjs/core/Meshes/mesh";
+import type { Geometry } from "@babylonjs/core/Meshes/geometry";
 import type { AbstractMesh } from "@babylonjs/core/Meshes/abstractMesh";
 import type { WebGPUEngine } from "@babylonjs/core/Engines/webgpuEngine";
 import type { Material } from "@babylonjs/core/Materials/material";
@@ -20,6 +21,7 @@ import { Matrix } from "@babylonjs/core/Maths/math.vector";
 import { WebGPUDataBuffer } from "@babylonjs/core/Meshes/WebGPU/webgpuDataBuffer";
 import { GetTextureDataAsync } from "@babylonjs/core/Misc/textureTools";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
+import type { GeometryInput } from "../core/geometry";
 import { COMMON_WGSL, RECEIVER_WGSL } from "../core/wgsl";
 
 // Babylon adapter. The core owns every GPU resource and runs on Babylon's own
@@ -175,6 +177,13 @@ export interface SundialBabylonOptions extends PagedShadowOptions {
    * classes that support plugins can receive.
    */
   receiveNewMaterials?: (material: Material) => boolean;
+  /**
+   * Debug: on every registration the memo skips, register the slow way too and
+   * compare the keys. A mismatch (a geometry change the memo missed: a stale
+   * shadow in the making) is logged, counted in registrationStats.verifyFailures,
+   * and the slow result is used. Costs what the memo saves.
+   */
+  verifyRegistrationMemo?: boolean;
 }
 
 const RECEIVER_CLASSES = new Set(["StandardMaterial", "PBRMaterial"]);
@@ -186,6 +195,15 @@ function canReceive(material: Material): boolean {
 
 /** A caster for setCasters(): a mesh, or a mesh with its options. */
 export type CasterEntry = Mesh | { mesh: Mesh; options?: CasterOptions };
+
+/** Longest an arrived alpha mask waits for the rest of its burst before the rebuild that brings it in. */
+const ALPHA_SETTLE_MS = 1000;
+
+interface StaticCaster {
+  groups: InstanceGroup[];
+  /** 16 floats per instance: the final world matrices registered or last updated. */
+  last: Float32Array;
+}
 
 interface DynamicCaster {
   mesh: Mesh;
@@ -219,6 +237,9 @@ function thinMatrixData(mesh: Mesh): Float32Array | null | undefined {
 const LOCAL = new Matrix();
 const PRODUCT = new Matrix();
 
+/** A run of a mesh's index buffer: a view into it where possible, else a copy. */
+type IndexRun = Uint32Array | Uint16Array | Int32Array;
+
 /**
  * The triangles of a mesh that cast, one run per material, following the
  * SubMesh contract in the World wiki (Prim-Draw-Call-Reduction §10b):
@@ -227,58 +248,126 @@ const PRODUCT = new Matrix();
  * never by the (conservative) vertex range. The material is resolved the way
  * the renderer resolves it, so a mesh with no material still casts (it draws
  * with the scene's default material).
+ *
+ * A material whose SubMeshes form one contiguous index range (the common case:
+ * one SubMesh, or a prim's faces grouped by material) gets a VIEW of the index
+ * buffer, not a copy: copying every index of every caster was 55-65 ms of a
+ * comm sim's rebuild. Its hash and compaction read the same values either way,
+ * so keys are unchanged. Only split ranges, or a number[] index buffer, copy.
  */
-function castingRuns(mesh: Mesh, indices: ArrayLike<number>): Map<Material | null, Uint32Array> {
+function castingRuns(mesh: Mesh, indices: ArrayLike<number>): Map<Material | null, IndexRun> {
   const root = mesh.material;
   const multi = root && (root as unknown as MultiMaterial).getSubMaterial ? (root as unknown as MultiMaterial) : null;
-  // Size each material's run first, then fill typed arrays: a rebuild walks
-  // every index of every caster, and pushing into JS arrays (then copying them
-  // to typed arrays to hash) was most of a rebuild's time.
-  const subMeshes: [Material | null, SubMesh][] = [];
-  const sizes = new Map<Material | null, number>();
+  const ranges = new Map<Material | null, [number, number][]>();
   for (const sm of mesh.subMeshes ?? []) {
     const material = multi ? multi.getSubMaterial(sm.materialIndex) : root;
     if (multi && !material) continue;
-    subMeshes.push([material, sm]);
-    sizes.set(material, (sizes.get(material) ?? 0) + sm.indexCount);
+    let list = ranges.get(material);
+    if (!list) ranges.set(material, (list = []));
+    list.push([sm.indexStart, sm.indexCount]);
   }
-  const runs = new Map<Material | null, Uint32Array>();
-  const fill = new Map<Material | null, number>();
-  for (const [material, size] of sizes) {
-    runs.set(material, new Uint32Array(size));
-    fill.set(material, 0);
-  }
-  for (const [material, sm] of subMeshes) {
-    const run = runs.get(material)!;
-    let w = fill.get(material)!;
-    for (let i = sm.indexStart, end = sm.indexStart + sm.indexCount; i < end; i++) run[w++] = indices[i];
-    fill.set(material, w);
+  const typed =
+    indices instanceof Uint32Array || indices instanceof Uint16Array || indices instanceof Int32Array ? indices : null;
+  const runs = new Map<Material | null, IndexRun>();
+  for (const [material, list] of ranges) {
+    let contiguous = true;
+    for (let k = 1; k < list.length && contiguous; k++) contiguous = list[k][0] === list[k - 1][0] + list[k - 1][1];
+    if (typed && contiguous) {
+      const start = list[0][0];
+      const last = list[list.length - 1];
+      runs.set(material, typed.subarray(start, last[0] + last[1]));
+      continue;
+    }
+    let size = 0;
+    for (const [, count] of list) size += count;
+    const run = new Uint32Array(size);
+    let w = 0;
+    for (const [start, count] of list) for (let i = start, end = start + count; i < end; i++) run[w++] = indices[i];
+    runs.set(material, run);
   }
   return runs;
 }
 
-/** Two 32-bit hashes (FNV-1a and a murmur-style mix) of the arrays' raw bits, as 16 hex digits. */
+const HASH_F32 = new Float32Array(1);
+const HASH_U32 = new Uint32Array(HASH_F32.buffer);
+
+/**
+ * Two 32-bit hashes (FNV-1a and a murmur-style mix) of the arrays' 32-bit
+ * words, as 16 hex digits. Allocates nothing per element: 32-bit arrays are
+ * read as their raw bits through a view, other integer arrays widen exactly
+ * (a Uint16Array index view hashes as the Uint32Array copy it replaced), and
+ * plain number[] (MeshBuilder keeps positions that way) and Float64Array go
+ * through float32. Never truncate those to integers: shapes that differed only
+ * by fractions of a unit then shared one key (and one shadow).
+ */
 function contentHash(...parts: ArrayLike<number>[]): string {
   let h1 = 0x811c9dc5;
   let h2 = 0x01000193 ^ 0x5bd1e995;
   for (const part of parts) {
-    // Raw bits of 32-bit arrays; other integer arrays widen exactly. Plain number[] (MeshBuilder
-    // keeps positions that way) and Float64Array must go through float32: Uint32Array.from()
-    // truncates every coordinate to an integer, and shapes that differed only by fractions of a
-    // unit then shared one key (and one shadow) once keys became content-addressed.
-    const words =
-      part instanceof Float32Array || part instanceof Uint32Array || part instanceof Int32Array
-        ? new Uint32Array(part.buffer, part.byteOffset, part.length)
-        : ArrayBuffer.isView(part) && !(part instanceof Float64Array)
-          ? Uint32Array.from(part as ArrayLike<number>)
-          : new Uint32Array(Float32Array.from(part as ArrayLike<number>).buffer);
-    for (let i = 0; i < words.length; i++) {
-      h1 = Math.imul(h1 ^ words[i], 0x01000193);
-      h2 = Math.imul(h2 ^ words[i], 0x5bd1e995) ^ (h2 >>> 15);
+    const n = part.length;
+    if (part instanceof Float32Array || part instanceof Uint32Array || part instanceof Int32Array) {
+      const words = new Uint32Array(part.buffer, part.byteOffset, n);
+      for (let i = 0; i < n; i++) {
+        h1 = Math.imul(h1 ^ words[i], 0x01000193);
+        h2 = Math.imul(h2 ^ words[i], 0x5bd1e995) ^ (h2 >>> 15);
+      }
+    } else if (ArrayBuffer.isView(part) && !(part instanceof Float64Array)) {
+      for (let i = 0; i < n; i++) {
+        const w = part[i] >>> 0;
+        h1 = Math.imul(h1 ^ w, 0x01000193);
+        h2 = Math.imul(h2 ^ w, 0x5bd1e995) ^ (h2 >>> 15);
+      }
+    } else {
+      for (let i = 0; i < n; i++) {
+        HASH_F32[0] = part[i];
+        const w = HASH_U32[0];
+        h1 = Math.imul(h1 ^ w, 0x01000193);
+        h2 = Math.imul(h2 ^ w, 0x5bd1e995) ^ (h2 >>> 15);
+      }
     }
-    h1 = Math.imul(h1 ^ words.length, 0x01000193);
+    h1 = Math.imul(h1 ^ n, 0x01000193);
   }
   return (h1 >>> 0).toString(16).padStart(8, "0") + (h2 >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Mutation counters per Babylon Geometry, bumped by a hook chained onto
+ * Geometry.onGeometryUpdated. Babylon routes every CPU-side geometry change
+ * through Geometry._notifyUpdate, which calls that hook: setVerticesData and
+ * setVerticesBuffer, updateVerticesData (Dozer edits positions IN PLACE and
+ * then calls it, so the array's identity never changes), updateVerticesDataDirectly,
+ * setAllVerticesData / VertexData.applyToMesh, setIndices, setIndexBuffer. The
+ * few paths that skip it are covered by identity in the registration
+ * signature instead: updateIndices() replaces the index array (it keeps a
+ * slice), removeVerticesData() drops the VertexBuffer, and VertexBuffer.update()
+ * called directly on a buffer swaps its data array.
+ */
+const geometryVersions = new WeakMap<Geometry, number>();
+type GeometryHook = ((geometry: Geometry, kind?: string) => void) & { sundial?: true };
+
+/** Chain the version hook onto a geometry once; returns the hook now installed. */
+function watchGeometry(geometry: Geometry): GeometryHook {
+  const current = geometry.onGeometryUpdated as GeometryHook | undefined;
+  if (current?.sundial) return current;
+  const hook: GeometryHook = (g, kind) => {
+    geometryVersions.set(g, (geometryVersions.get(g) ?? 0) + 1);
+    current?.(g, kind);
+  };
+  hook.sundial = true;
+  geometry.onGeometryUpdated = hook;
+  return hook;
+}
+
+/** What a mesh's last full registration produced: the signature it was read under, and its keys in group order. */
+interface RegistrationMemo {
+  signature: unknown[];
+  keys: string[];
+}
+
+function sameSignature(a: unknown[], b: unknown[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+  return true;
 }
 
 /** Keep only the vertices a run uses, so a mesh split by material does not upload its vertices once per material. */
@@ -371,8 +460,28 @@ export class SundialBabylon {
   /** @internal */ readonly pageTable: StorageLike;
 
   private readonly dynamics: DynamicCaster[] = [];
+  /** Static casters by mesh, for updateCasterMatrices. */
+  private readonly statics = new Map<Mesh, StaticCaster[]>();
   private entries: { mesh: Mesh; options?: CasterOptions }[] = [];
   private rebuildPending = false;
+  /**
+   * An alpha mask came in since the last rebuild. Masks usually arrive in a
+   * burst as content loads; the rebuild that brings them in waits until no
+   * mask is still loading (or ALPHA_SETTLE_MS after the first one landed), so
+   * a burst costs one rebuild, not one per texture.
+   */
+  private alphaRebuildPending = false;
+  private alphaReadyAt = 0;
+  private readonly memos = new WeakMap<Mesh, RegistrationMemo>();
+  /** See SundialBabylonOptions.verifyRegistrationMemo. */
+  verifyRegistrationMemo: boolean;
+  /**
+   * Registrations since construction: `memoHits` skipped reading and hashing
+   * the mesh's geometry because nothing it depends on changed; `memoMisses`
+   * did the full work. `verifyFailures` counts memo hits the debug check
+   * (verifyRegistrationMemo) caught registering different content.
+   */
+  readonly registrationStats = { memoHits: 0, memoMisses: 0, verifyFailures: 0 };
   private readonly alphaLayers = new Map<string, AlphaLayer>();
   private warnedAlphaLayers = false;
   private disposed = false;
@@ -417,6 +526,7 @@ export class SundialBabylon {
     this.light = light;
     this.getCamera = options.getCamera ?? (() => scene.activeCameras?.[0] ?? scene.activeCamera);
     this.receiveNewMaterials = options.receiveNewMaterials ?? (() => true);
+    this.verifyRegistrationMemo = !!options.verifyRegistrationMemo;
     const engine = scene.getEngine() as WebGPUEngine;
     if (!engine.isWebGPU) throw new Error("Sundial needs the WebGPU engine");
     makeMainDepthReadable(engine);
@@ -460,24 +570,134 @@ export class SundialBabylon {
     return this.rebuild();
   }
 
-  private rebuild(): InstanceGroup[][] {
+  /**
+   * Update a registered STATIC caster's instance transforms without a
+   * rebuild. `matrices` has the layout of CasterOptions.instanceMatrices: 16
+   * floats per instance, instance-local (the mesh's world matrix is applied),
+   * one instance for a mesh that is not thin-instanced. Only instances whose
+   * final matrix changed are rewritten; each re-renders its old and new
+   * footprint, nothing else. Later rebuilds keep these matrices.
+   *
+   * Returns false, changing nothing, when the mesh is not registered as a
+   * static caster or the instance count differs from the registered one: the
+   * caller must then rebuild (setCasters) instead.
+   */
+  updateCasterMatrices(mesh: Mesh, matrices: Float32Array): boolean {
+    const records = this.statics.get(mesh);
+    if (!records?.length || matrices.length === 0 || matrices.length % 16 !== 0) return false;
+    const count = matrices.length / 16;
+    if (records.some((r) => r.last.length !== count * 16)) return false;
+    const now = casterMatrices(mesh, matrices);
+    for (const r of records) {
+      for (let i = 0; i < count; i++) {
+        const o = i * 16;
+        let moved = false;
+        for (let k = 0; k < 16; k++) {
+          if (now[o + k] !== r.last[o + k]) {
+            moved = true;
+            break;
+          }
+        }
+        if (!moved) continue;
+        for (let k = 0; k < 16; k++) r.last[o + k] = now[o + k];
+        for (const g of r.groups) this.core.setInstanceMatrix(g, i, now, o);
+      }
+    }
+    // A later rebuild (an alpha mask landing, addCaster) re-registers from the
+    // entries, so they must carry these matrices, or the shadow would jump back.
+    const kept = matrices.slice();
+    this.entries = this.entries.map((e) =>
+      e.mesh === mesh && !e.options?.dynamic ? { mesh, options: { ...e.options, instanceMatrices: kept } } : e,
+    );
+    return true;
+  }
+
+  private rebuild(internal = false): InstanceGroup[][] {
     this.rebuildPending = false;
+    // Every registration below reads the alpha layers as they are now.
+    this.alphaRebuildPending = false;
     this.dynamics.length = 0;
+    this.statics.clear();
     this.core.clearContent();
     const groups = this.entries.map((e) => this.register(e.mesh, e.options ?? {}));
-    if (this.running) this.core.build();
+    if (this.running) this.core.build({ internal });
     return groups;
   }
 
-  private register(mesh: Mesh, opts: CasterOptions): InstanceGroup[] {
-    const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
+  /**
+   * Everything a registration's geometry keys depend on, cheap to gather and
+   * compared by identity: the geometry and its mutation version (and the hook
+   * that counts them, which someone could have replaced), the vertex buffers
+   * and data arrays the positions and UVs are read from, the index array, the
+   * alpha options, each SubMesh's layout and resolved material, and for every
+   * material that alpha-tests, its texture, cutoff, UV set, texture matrix and
+   * whether its mask has been read. Null when the mesh has no geometry.
+   */
+  private registrationSignature(mesh: Mesh, opts: CasterOptions): unknown[] | null {
+    const geometry = mesh.geometry;
+    if (!geometry) return null;
+    const hook = watchGeometry(geometry);
+    const sig: unknown[] = [geometry, hook, geometryVersions.get(geometry) ?? 0, mesh.getTotalVertices()];
+    for (const kind of [VertexBuffer.PositionKind, VertexBuffer.UVKind, VertexBuffer.UV2Kind]) {
+      const vb = mesh.getVertexBuffer(kind);
+      sig.push(vb, vb?.getData() ?? null);
+    }
     const indices = mesh.getIndices();
-    if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
-    const explicit = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
-    // Content-addressed, not by Babylon's geometry id: a prim that is deleted and
-    // re-created with the same shape (World does this on load and on edits) keeps
-    // its clusters, and identical shapes on different meshes share one geometry.
-    const scope = `${positions.length}:${contentHash(positions)}`;
+    sig.push(indices, indices?.length ?? -1);
+    sig.push(opts.alphaLayer, opts.alphaCutoff, opts.autoAlpha);
+    const root = mesh.material;
+    const multi = root && (root as unknown as MultiMaterial).getSubMaterial ? (root as unknown as MultiMaterial) : null;
+    sig.push(root);
+    const materials = new Set<Material | null>();
+    for (const sm of mesh.subMeshes ?? []) {
+      const material = multi ? multi.getSubMaterial(sm.materialIndex) : root;
+      sig.push(sm.materialIndex, sm.indexStart, sm.indexCount, material);
+      materials.add(material);
+    }
+    if (opts.alphaLayer === undefined && opts.autoAlpha !== false) {
+      for (const material of materials) {
+        const source = multi && !material ? null : alphaSource(material, mesh);
+        if (!source) {
+          sig.push(null);
+          continue;
+        }
+        const texture = source.texture as TextureLike;
+        sig.push(texture, source.cutoff, texture.coordinatesIndex);
+        const m = texture.getTextureMatrix?.().m;
+        if (m) sig.push(m[0], m[1], m[4], m[5], m[8], m[9]);
+        sig.push(this.alphaLayerFor(source)?.layer ?? -1);
+      }
+    }
+    return sig;
+  }
+
+  /**
+   * Register a mesh's casting runs. A mesh registered before, whose
+   * registration signature has not changed and whose keys are all still
+   * cached, reuses its keys: no reading, copying or hashing of its geometry,
+   * which was most of an unchanged rebuild. Anything else goes the full way.
+   */
+  private register(mesh: Mesh, opts: CasterOptions): InstanceGroup[] {
+    const signature = this.registrationSignature(mesh, opts);
+    const memo = this.memos.get(mesh);
+    let runs: { key: string; input?: () => GeometryInput }[];
+    if (signature && memo && sameSignature(memo.signature, signature) && memo.keys.every((k) => this.core.hasGeometry(k))) {
+      this.registrationStats.memoHits++;
+      runs = memo.keys.map((key) => ({ key }));
+      if (this.verifyRegistrationMemo) {
+        const full = this.readRuns(mesh, opts);
+        if (full.length !== runs.length || full.some((r, i) => r.key !== runs[i].key)) {
+          this.registrationStats.verifyFailures++;
+          console.error(`Sundial: registration memo for ${mesh.name} was stale`, { memo: memo.keys, actual: full.map((r) => r.key) });
+          runs = full;
+          this.memos.set(mesh, { signature, keys: full.map((r) => r.key) });
+        }
+      }
+    } else {
+      this.registrationStats.memoMisses++;
+      runs = this.readRuns(mesh, opts);
+      if (signature) this.memos.set(mesh, { signature, keys: runs.map((r) => r.key) });
+    }
     let matrices = casterMatrices(mesh, opts.dynamic ? undefined : opts.instanceMatrices);
     if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
       // Reserved slots start as zero matrices, which cast nothing.
@@ -486,6 +706,48 @@ export class SundialBabylon {
       matrices = padded;
     }
     const groups: InstanceGroup[] = [];
+    for (const run of runs) {
+      // A memo hit has no input: hasGeometry() said every key is registered or cached.
+      const geometry = this.core.addGeometry(
+        run.input ??
+          (() => {
+            throw new Error(`Sundial: ${mesh.name}: memoised geometry ${run.key} is not cached`);
+          }),
+        run.key,
+      );
+      groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
+    }
+    if (groups.length) {
+      if (opts.dynamic) {
+        this.dynamics.push({
+          mesh,
+          groups,
+          last: matrices.slice(),
+          now: new Float32Array(matrices.length),
+          // casterMatrices just computed it: the flag of exactly the matrix `last` was built from.
+          worldFlag: (mesh as WorldState)._worldMatrix.updateFlag,
+          thin: mesh.thinInstanceCount > 0 && !!thinMatrixData(mesh),
+        });
+      } else {
+        let list = this.statics.get(mesh);
+        if (!list) this.statics.set(mesh, (list = []));
+        list.push({ groups, last: matrices.slice() });
+      }
+    }
+    return groups;
+  }
+
+  /** The full registration read: each casting run's content key, and how to build its geometry on a cache miss. */
+  private readRuns(mesh: Mesh, opts: CasterOptions): { key: string; input: () => GeometryInput }[] {
+    const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
+    const indices = mesh.getIndices();
+    if (!positions || !indices) throw new Error(`Sundial: ${mesh.name} has no geometry`);
+    const explicit = opts.alphaLayer !== undefined ? { layer: opts.alphaLayer, cutoff: opts.alphaCutoff ?? 0.5 } : undefined;
+    // Content-addressed, not by Babylon's geometry id: a prim that is deleted and
+    // re-created with the same shape (World does this on load and on edits) keeps
+    // its clusters, and identical shapes on different meshes share one geometry.
+    const scope = `${positions.length}:${contentHash(positions)}`;
+    const out: { key: string; input: () => GeometryInput }[] = [];
     for (const [material, run] of castingRuns(mesh, indices)) {
       if (run.length < 3) continue;
       let alpha = explicit;
@@ -501,21 +763,9 @@ export class SundialBabylon {
       if (!alpha) uvs = null;
       const key = `${scope}:${contentHash(run)}:${alpha ? `${alpha.layer}/${alpha.cutoff}:${contentHash(uvs!)}` : "opaque"}`;
       // Compacted only on a cache miss: on a rebuild of unchanged content it is never needed.
-      const geometry = this.core.addGeometry(() => ({ ...compact(run, positions, uvs), alpha }), key);
-      groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
+      out.push({ key, input: () => ({ ...compact(run, positions, uvs), alpha }) });
     }
-    if (opts.dynamic && groups.length) {
-      this.dynamics.push({
-        mesh,
-        groups,
-        last: matrices.slice(),
-        now: new Float32Array(matrices.length),
-        // casterMatrices just computed it: the flag of exactly the matrix `last` was built from.
-        worldFlag: (mesh as WorldState)._worldMatrix.updateFlag,
-        thin: mesh.thinInstanceCount > 0 && !!thinMatrixData(mesh),
-      });
-    }
-    return groups;
+    return out;
   }
 
   /**
@@ -545,7 +795,8 @@ export class SundialBabylon {
           canvas.getContext("2d")!.putImageData(new ImageData(px, size, size), 0, 0);
           this.core.setAlphaLayer(loaded.layer, canvas, loaded.cutoff);
           loaded.state = "ready";
-          this.rebuildPending = true;
+          if (!this.alphaRebuildPending) this.alphaReadyAt = performance.now();
+          this.alphaRebuildPending = true;
         })
         .catch((e) => {
           loaded.state = "failed";
@@ -623,6 +874,7 @@ export class SundialBabylon {
     this.setEnabled(false);
     this.running = false;
     this.dynamics.length = 0;
+    this.statics.clear();
     this.poolTexture.dispose();
     this.minMaxTexture.dispose();
     this.core.dispose();
@@ -666,7 +918,12 @@ export class SundialBabylon {
 
   private update(): void {
     if (!this.enabled) return;
-    if (this.rebuildPending) this.rebuild();
+    if (
+      this.alphaRebuildPending &&
+      (performance.now() - this.alphaReadyAt > ALPHA_SETTLE_MS || ![...this.alphaLayers.values()].some((l) => l.state === "loading"))
+    )
+      this.rebuildPending = true;
+    if (this.rebuildPending) this.rebuild(true);
     this.updateDynamics();
     const camera = this.getCamera();
     if (!camera) return;
