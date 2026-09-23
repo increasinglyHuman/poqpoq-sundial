@@ -187,8 +187,12 @@ fn psVisibility(posW: vec3f, normalW: vec3f) -> f32 {
       let phys1 = psLookup(level, page);
       if (phys1 != 0u) {
         psDebugLevel = f32(level);
-        let z = (dot(p, lv.dir.xyz) - lv.depth.x) * lv.depth.y
-              - psParams.tuning.z * lv.dir.w * lv.depth.y;
+        // Clamped to the far plane: a receiver past the depth range (a sea beyond
+        // the scene bounds) would otherwise fail every tap against the cleared
+        // pool (1.0) and read shadowed. At 1.0 it is lit unless a caster in range
+        // covers it, and casters always rasterize below 1.0.
+        let z = min((dot(p, lv.dir.xyz) - lv.depth.x) * lv.depth.y
+              - psParams.tuning.z * lv.dir.w * lv.depth.y, 1.0);
         // 3x3 bilinear PCF over a 4x4 texel footprint. The nine taps collapse to
         // separable per-texel weights (1-f, 1, 1, f), so no array is needed.
         let t = lp * s - vec2f(1.5);

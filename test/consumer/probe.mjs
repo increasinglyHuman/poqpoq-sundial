@@ -65,6 +65,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       Math.abs(res.moveApi.lumaBack - res.moveApi.lumaPosts) < 0.02 &&
       // requests are per frame: empty sky requests fewer pages than the ground, and they come back
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
+      // a receiver past the depth range, with no caster over it, is lit: darkness changes nothing there
+      Math.abs(res.farReceiver.lit - res.farReceiver.shadowed) < 0.5 &&
       // after dispose, a second instance took over the same materials and is paging
       res.second.rebound && res.second.enabled && res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1 &&
       // fully faded shadows stop all GPU work, and come back unchanged on waking
