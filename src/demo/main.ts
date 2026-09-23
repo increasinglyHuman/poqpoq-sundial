@@ -124,6 +124,9 @@ async function main() {
     poolSize: 4096,
     finestPageWorldSize: 1,
     renderBudget: num("budget", 96),
+    // ?cache=0: no static cache (one pool; movers re-render the pages they cross).
+    staticCache: q.get("cache") !== "0",
+    dynamicBudget: num("dynBudget", 64),
     clipDistances: q.get("clip") !== "0",
   });
   // The lab reports GPU pass times, so it profiles by default (the library does
@@ -134,8 +137,43 @@ async function main() {
   sundial.addCaster(world.trunks);
   sundial.addCaster(world.leaves, { alphaLayer: 0, alphaCutoff: 0.5 });
   for (const p of world.prims) sundial.addCaster(p);
+  // ?movers=N: N more avatars walking loops through the forest, for the
+  // static cache's A/B (each one crosses pages full of alpha-tested trees).
+  const extraMovers = Math.max(0, Math.floor(num("movers", 0)));
+  if (extraMovers > 0) {
+    const walkerMat = new StandardMaterial("walker", scene);
+    walkerMat.diffuseColor = new Color3(0.8, 0.3, 0.2);
+    world.materials.push(walkerMat);
+    let seed = 99;
+    const rnd = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+    for (let i = 0; i < extraMovers; i++) {
+      const walker = MeshBuilder.CreateCapsule(`walker${i}`, { height: 1.8, radius: 0.32 }, scene);
+      walker.material = walkerMat;
+      walker.receiveShadows = true;
+      // Loops of 6..16 m radius, centred in the forest east of the village.
+      const cx = 40 + rnd() * 70;
+      const cz = -80 + rnd() * 70;
+      const rad = 6 + rnd() * 10;
+      const speed = (0.3 + rnd() * 0.5) * (rnd() < 0.5 ? -1 : 1);
+      const phase = rnd() * Math.PI * 2;
+      world.movers.push({
+        mesh: walker,
+        update(t) {
+          const a = phase + (t * speed * 4) / rad;
+          const x = cx + Math.cos(a) * rad;
+          const z = cz + Math.sin(a) * rad;
+          walker.position.set(x, world.heightAt(x, z) + 0.9, z);
+        },
+      });
+    }
+  }
+  // ?t=seconds starts the movers' clock there; ?stopAt=seconds freezes it
+  // there. Moving from 0 to stopAt must end on the same image as ?t=stopAt
+  // with animate=0: nothing left behind where the movers were.
+  const startT = num("t", 0);
+  const stopAt = num("stopAt", Infinity);
   for (const m of world.movers) {
-    m.update(0);
+    m.update(startT);
     sundial.addCaster(m.mesh, { dynamic: true });
   }
   // ?thinmover=1: a dynamic THIN-INSTANCED caster (four pillars, the third
@@ -247,11 +285,11 @@ async function main() {
   walkDir.normalize();
   const hud = document.getElementById("stats")!;
   let frameMs = 16;
-  let t = 0;
+  let t = startT;
   scene.onBeforeRenderObservable.add(() => {
     const dt = engine.getDeltaTime() / 1000;
     frameMs = frameMs * 0.95 + engine.getDeltaTime() * 0.05;
-    if (state.animate) t += dt;
+    if (state.animate) t = Math.min(stopAt, t + dt);
     for (const m of world.movers) m.update(t);
     if (walkSpeed > 0) {
       // Walk back and forth along a 120 m line through the forest.
@@ -287,7 +325,8 @@ async function main() {
         `raster GPU    ${s.gpuRasterMs?.toFixed(3) ?? "n/a"} ms`,
         `pages         ${s.requestedPages} wanted · ${s.residentPages} resident / ${sundial.core.pageCount}`,
         `this frame    ${s.renderedPages} drawn · ${s.deferredPages} deferred · ${s.allocationFailures} alloc fails`,
-        `pairs         ${s.opaquePairs} opaque · ${s.alphaPairs} alpha`,
+        `static cache  ${sundial.core.staticCache ? `${s.dynamicPages} dynamic · ${s.dynamicDeferred} deferred · ${s.compositedPages} composited` : "off"}`,
+        `pairs         ${s.opaquePairs} opaque · ${s.alphaPairs} alpha · ${s.dynamicPairs} dynamic`,
         `level refresh ${s.levelRefreshes} (last L${s.lastRefreshedLevel})`,
         `clip distances ${sundial.core.useClipDistances ? "yes" : "no (discard)"}`,
       );
@@ -303,7 +342,7 @@ async function main() {
   }, 250);
 
   // Benchmark: sample every frame for `ms`, report medians and p95.
-  const samples: { frame: number[]; mark: number[]; paging: number[]; raster: number[]; rendered: number[]; csm: number[] } = { frame: [], mark: [], paging: [], raster: [], rendered: [], csm: [] };
+  const samples: { frame: number[]; mark: number[]; paging: number[]; raster: number[]; rendered: number[]; dynamic: number[]; csm: number[] } = { frame: [], mark: [], paging: [], raster: [], rendered: [], dynamic: [], csm: [] };
   let sampling = false;
   let lastStatsFrame = -1;
   scene.onAfterRenderObservable.add(() => {
@@ -316,6 +355,7 @@ async function main() {
       samples.paging.push(s.gpuComputeMs);
       samples.raster.push(s.gpuRasterMs ?? 0);
       samples.rendered.push(s.renderedPages);
+      samples.dynamic.push(s.dynamicPages);
     }
     const ns = (csm?.getShadowMap()?.renderTarget as unknown as { gpuTimeInFrame?: { counter: { current: number } } })
       ?.gpuTimeInFrame?.counter.current;
@@ -326,6 +366,7 @@ async function main() {
     const b = [...a].sort((x, y) => x - y);
     return { median: b[Math.floor(b.length / 2)], p95: b[Math.floor(b.length * 0.95)], n: b.length };
   };
+  const mean = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
   const bench = async (ms: number) => {
     for (const k of Object.keys(samples) as (keyof typeof samples)[]) samples[k] = [];
     sampling = true;
@@ -344,7 +385,7 @@ async function main() {
       effects: Object.keys((engine as unknown as { _compiledEffects: object })._compiledEffects ?? {}).length,
       samples: samples.frame.length,
     };
-    return { snapshot, frame: { median: frameMs, p95: frameMs, n: samples.frame.length }, mark: stat(samples.mark), paging: stat(samples.paging), raster: stat(samples.raster), rendered: stat(samples.rendered), rasterMax: samples.raster.length ? Math.max(...samples.raster) : null, csmShadow: stat(samples.csm) };
+    return { snapshot, frame: { median: frameMs, p95: frameMs, n: samples.frame.length }, mark: stat(samples.mark), paging: stat(samples.paging), raster: stat(samples.raster), rendered: stat(samples.rendered), dynamic: stat(samples.dynamic), renderedMean: mean(samples.rendered), dynamicMean: mean(samples.dynamic), rasterMean: mean(samples.raster), rasterMax: samples.raster.length ? Math.max(...samples.raster) : null, csmShadow: stat(samples.csm) };
   };
 
   (window as unknown as Record<string, unknown>).sundial = {
