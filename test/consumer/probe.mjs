@@ -1,7 +1,7 @@
 // Loads the consumer page on WebGL2 and WebGPU in real Chrome and asserts:
 // the import never throws, isSupported() matches the backend, and on WebGPU
 // pages are requested and resident with no allocation failures or errors.
-// Starts and stops its own Vite dev server on port 5189.
+// Starts and stops its own Vite dev server on port 5189 (or $CONSUMER_PORT).
 import { chromium } from "../../node_modules/playwright-core/index.mjs";
 import { createServer } from "vite";
 import { readdirSync, existsSync } from "node:fs"; import { join } from "node:path";
@@ -15,7 +15,7 @@ let failed = false;
 for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "webgpu&pbr=1", "webgpu&csm=1"]) {
   const p = await b.newPage({ viewport: { width: 1200, height: 800 } });
   const errs = []; p.on("pageerror", (e) => errs.push(e.message)); p.on("console", (m) => { if (m.type() === "error" && !/404/.test(m.text())) errs.push(m.text().slice(0, 160)); });
-  await p.goto(`http://localhost:5189/?engine=${engine}`);
+  await p.goto(`http://localhost:${process.env.CONSUMER_PORT ?? 5189}/?engine=${engine}`);
   await p.waitForFunction(() => window.__ready === true, null, { timeout: 60000 });
   await p.waitForFunction(() => window.__result.done || !window.__result.supported || window.__result.error, null, { timeout: 30000 });
   await p.waitForTimeout(500);
