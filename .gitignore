@@ -8,6 +8,13 @@ shots/
 *.log
 *.png
 !docs/**/*.png
+!docs/**/*.jpg
+
+# internal notes: handoffs and team comms live outside the repo
+# (poqpoq-sundial-private/); never commit them to this public repo
+docs/handoff/
+docs/internal/
+docs/TEAM_COMMS.md
 
 # secrets and machine config — never commit
 .env
