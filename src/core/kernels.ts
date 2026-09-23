@@ -395,12 +395,12 @@ ${COMMON_WGSL}
 fn markPages(@builtin(global_invocation_id) gid: vec3u) {
   let stride = u32(psParams.screen.z);
   // One sample per stride x stride cell: its centre, or with rotation on
-  // (shade.y), a different pixel of the cell every frame, so that over
+  // (shade.z), a different pixel of the cell every frame, so that over
   // stride^2 frames every pixel is sampled. A page is only evicted after going
   // unrequested for OLD_AGE frames, so a sparser stride keeps what it misses in
   // one frame resident through the next.
   var offset = vec2u(stride / 2u);
-  if (psParams.shade.y != 0.0) {
+  if (psParams.shade.z != 0.0) {
     let k = psParams.grid.z % (stride * stride);
     offset = vec2u(k % stride, (k / stride + k % stride) % stride);
   }

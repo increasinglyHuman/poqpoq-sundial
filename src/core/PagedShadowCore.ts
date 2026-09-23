@@ -15,8 +15,9 @@ import {
   workLayout,
   type WorkLayout,
 } from "./kernels";
+import { minMaxWGSL } from "./minmax";
 import { rasterWGSL } from "./raster";
-import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, PARAMS_BYTES, PARAMS_HEADER_BYTES, SHADE_WORD } from "./wgsl";
+import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, MINMAX_TILE, PARAMS_BYTES, PARAMS_HEADER_BYTES, SHADE_WORD } from "./wgsl";
 
 // Sundial: a paged, cached shadow clipmap for one directional light.
 //
@@ -90,6 +91,13 @@ export interface Tuning {
    * it already computes (fill, dusk fade).
    */
   darkness: number;
+  /**
+   * Receivers skip PCF where the per-page min/max depth atlas shows the whole
+   * filter footprint lit or shadowed (identical output, fewer texel loads).
+   * false stops building the atlas too; turning it back on re-renders every
+   * page so the atlas is complete again. For A/B measurement.
+   */
+  minMaxEarlyOut: boolean;
 }
 
 export interface Stats {
@@ -192,6 +200,7 @@ export class PagedShadowCore {
     bandDegrees: 0.05,
     renderBudget: 96,
     darkness: 0,
+    minMaxEarlyOut: true,
   };
 
   /** Resources receivers bind (params, page table, pool). */
@@ -199,6 +208,13 @@ export class PagedShadowCore {
   readonly pageTableBuffer: GPUBuffer;
   readonly requestBuffer: GPUBuffer;
   readonly poolTexture: GPUTexture;
+  /**
+   * Per-page min/max depth over the pool (see minmax.ts), rg32uint holding f32
+   * bits at 1/MINMAX_TILE of the pool's resolution. Receivers bind it next to
+   * the pool; it is 1x1 and unused when the page size is not a multiple of
+   * MINMAX_TILE.
+   */
+  readonly minMaxTexture: GPUTexture;
 
   stats: Stats = {
     frame: 0, requestedPages: 0, residentPages: 0, renderedPages: 0, deferredPages: 0, allocations: 0,
@@ -229,6 +245,16 @@ export class PagedShadowCore {
   readonly alphaSize: number;
   readonly alphaLayerCount: number;
   private readonly alphaSampler: GPUSampler;
+  /** The page size allows a min/max atlas at all. */
+  private readonly minMaxSupported: boolean;
+  /**
+   * The atlas matches the pool for every valid page. True from the start (no
+   * page is valid yet); false while tuning.minMaxEarlyOut is off, since pages
+   * rendered then get no min/max.
+   */
+  private minMaxLive = true;
+  private minMaxPipeline!: GPUComputePipeline;
+  private minMaxGroup!: GPUBindGroup;
   private readonly params = new ArrayBuffer(PARAMS_BYTES);
   // Persistent views of `params` and of the mark block: writeParams and
   // markInto run every frame and must not allocate (a GC pause is a hitch).
@@ -380,6 +406,14 @@ export class PagedShadowCore {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
     this.poolView = this.poolTexture.createView();
+    this.minMaxSupported = this.pageSize % MINMAX_TILE === 0;
+    const mm = this.minMaxSupported ? this.poolSize / MINMAX_TILE : 1;
+    this.minMaxTexture = device.createTexture({
+      label: "ps.minMax",
+      size: [mm, mm],
+      format: "rg32uint",
+      usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
+    });
     this.alphaSize = options.alphaTextureSize ?? 256;
     const alphaLayers = (this.alphaLayerCount = options.maxAlphaLayers ?? 4);
     this.alphaTexture = device.createTexture({
@@ -761,6 +795,7 @@ export class PagedShadowCore {
     this.queryResolve?.destroy();
     this.querySet?.destroy();
     this.poolTexture.destroy();
+    this.minMaxTexture.destroy();
     this.alphaTexture.destroy();
     this.geometryCache.clear();
     this.depthBinding = null;
@@ -866,6 +901,12 @@ export class PagedShadowCore {
     }
     const d = this.device;
     this.frame++;
+    // Pages rendered while the early-out was off have no min/max: re-render
+    // them all before receivers may trust the atlas again (invalid pages are
+    // never read, so no stale bound is ever used).
+    const minMax = this.minMaxSupported && this.tuning.minMaxEarlyOut;
+    if (minMax && !this.minMaxLive) this.invalidateAll();
+    this.minMaxLive = minMax;
     const lightDir = normalize(input.lightDir);
     this.refreshLevels(lightDir);
     this.uploadDirtyInstances();
@@ -953,6 +994,17 @@ export class PagedShadowCore {
     rp.setPipeline(this.alphaPipeline);
     rp.drawIndirect(this.workBuffer, indirect + 32);
     rp.end();
+    // Min/max of every page just rendered, in its own pass after the raster
+    // so the pool reads see this frame's depth. Pages not rendered this frame
+    // keep both their depth and their min/max, so the atlas stays exact.
+    if (minMax) {
+      const mp = enc.beginComputePass({ label: "ps.minMax" });
+      mp.setPipeline(this.minMaxPipeline);
+      mp.setBindGroup(0, this.minMaxGroup);
+      const blocks = Math.ceil(this.pageSize / MINMAX_TILE / 8);
+      mp.dispatchWorkgroups(blocks, blocks, Math.min(this.tuning.renderBudget, this.renderBudgetMax));
+      mp.end();
+    }
     this.started = true;
 
     // Counters every statsInterval frames (from the first), or every frame while profiling.
@@ -1083,8 +1135,8 @@ export class PagedShadowCore {
     } else {
       f[36] = 0; f[37] = 0; f[38] = this.markStride; f[39] = 0;
     }
-    f[SHADE_WORD] = Math.min(1, Math.max(0, t.darkness)); f[SHADE_WORD + 1] = this.markRotate && this.markStride > 1 ? 1 : 0;
-    f[SHADE_WORD + 2] = 0; f[SHADE_WORD + 3] = 0;
+    f[SHADE_WORD] = Math.min(1, Math.max(0, t.darkness)); f[SHADE_WORD + 1] = this.minMaxLive ? 1 : 0;
+    f[SHADE_WORD + 2] = this.markRotate && this.markStride > 1 ? 1 : 0; f[SHADE_WORD + 3] = 0;
 
     const lo = this.sceneMin;
     const hi = this.sceneMax;
@@ -1291,6 +1343,30 @@ export class PagedShadowCore {
         ...Array.from({ length: 8 }, (_, binding) => ({ binding, ...storage("read-only-storage", V) })),
         { binding: 8, visibility: F, texture: { viewDimension: "2d-array", sampleType: "float" } },
         { binding: 9, visibility: F, sampler: { type: "filtering" } },
+      ],
+    });
+
+    // Min/max build: its own layout, since the pool (a depth texture) and a
+    // storage texture have no place in the storage-buffer-only compute layout.
+    const minMaxLayout = d.createBindGroupLayout({
+      label: "ps.minMaxLayout",
+      entries: [
+        ...Array.from({ length: 3 }, (_, binding) => ({ binding, ...storage("read-only-storage", C) })),
+        { binding: 3, visibility: C, texture: { sampleType: "depth" } },
+        { binding: 4, visibility: C, storageTexture: { access: "write-only", format: "rg32uint" } },
+      ],
+    });
+    this.minMaxPipeline = d.createComputePipeline({
+      label: "ps.buildMinMax",
+      layout: d.createPipelineLayout({ bindGroupLayouts: [minMaxLayout] }),
+      compute: { module: d.createShaderModule({ label: "ps.minMax", code: minMaxWGSL(this.work) }), entryPoint: "buildMinMax" },
+    });
+    this.minMaxGroup = d.createBindGroup({
+      layout: minMaxLayout,
+      entries: [
+        ...[this.paramsBuffer, this.pageTableBuffer, this.workBuffer].map((buffer, binding) => ({ binding, resource: { buffer } })),
+        { binding: 3, resource: this.poolTexture.createView({ aspect: "depth-only" }) },
+        { binding: 4, resource: this.minMaxTexture.createView() },
       ],
     });
 

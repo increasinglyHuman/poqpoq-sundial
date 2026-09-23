@@ -159,6 +159,8 @@ async function main() {
   sundial.addReceivers(world.materials);
   sundial.core.tuning.debugMode = q.get("debug") === "1" ? 1 : 0;
   sundial.core.tuning.lodBias = num("lodBias", 0);
+  // ?minmax=0: full PCF everywhere, no min/max atlas (A/B for the early-out).
+  sundial.core.tuning.minMaxEarlyOut = q.get("minmax") !== "0";
   sundial.core.markStride = num("stride", 2);
   sundial.core.markRotate = q.get("rotate") === "1";
   // ?hud=1: a second, HUD-style camera rendered after the world camera, as in

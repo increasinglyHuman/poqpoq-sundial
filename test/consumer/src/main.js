@@ -201,6 +201,21 @@ try {
         const at = (hv, side) => (hv.left < clean.left - 0.05 && Math.abs(hv.right - clean.right) < 0.02 ? "A" : hv.right < clean.right - 0.05 && Math.abs(hv.left - clean.left) < 0.02 ? "B" : "?");
         r.dynamicFollow = { atA: at(atA), viaParent: at(viaParent), viaPosition: at(viaPosition), thinA: at(thinA), thinB: at(thinB), clean, atA_: atA, viaParent_: viaParent, viaPosition_: viaPosition, thinA_: thinA, thinB_: thinB };
       }
+      // The min/max early-out skips PCF only where PCF's answer is already known, so the frame is
+      // pixel-identical with it off; and turning it back on (which re-renders every page to rebuild
+      // the atlas) lands on the same frame again. A stale or too-narrow min/max changes pixels.
+      {
+        const w = engine.getRenderWidth(), h = engine.getRenderHeight();
+        const shot = async () => { const px = await engine.readPixels(0, 0, w, h); return new Uint8Array(px.buffer, px.byteOffset, px.byteLength).slice(); };
+        const diff = (a, b) => { let n = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) n++; return n; };
+        await frames(10);
+        const on = await shot();
+        sd.core.tuning.minMaxEarlyOut = false; await frames(20);
+        const off = await shot();
+        sd.core.tuning.minMaxEarlyOut = true; await frames(30);
+        // One read per rendered frame: a second read of the same frame hits a destroyed swap texture.
+        r.minMax = { diffOff: diff(on, off), diffBack: diff(on, await shot()) };
+      }
       // Requests are per frame (review F1, PR #9): look at empty sky and the pages the ground asked
       // for must stop being requested. If the request buffer were never cleared they would stay.
       r.requestedGround = sd.core.stats.requestedPages;

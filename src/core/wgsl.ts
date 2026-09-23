@@ -1,8 +1,11 @@
 // Shared WGSL for Sundial: the data layout every kernel, raster pipeline and
 // receiver agrees on. Engine adapters splice RECEIVER_WGSL into their own
-// fragment shaders after declaring the four bindings listed there.
+// fragment shaders after declaring the bindings listed there.
 
 export const MAX_LEVELS = 8;
+
+/** Pool texels per min/max atlas texel on each axis (see minmax.ts). */
+export const MINMAX_TILE = 2;
 
 /** Byte size of one PsLevel (7 × vec4). */
 export const LEVEL_BYTES = 7 * 16;
@@ -43,8 +46,9 @@ struct PsParams {
   misc: vec4u,    // x = invalidation region count, y = cluster instance count, z = max pairs, w = cluster count
   invViewProj: mat4x4f, // camera clip -> world, for the frame whose depth is being marked
   screen: vec4f,  // x = depth width, y = depth height, z = marking stride in pixels, w = 1 when depth is bound
-  shade: vec4f,   // x = darkness: light left in full shadow (0 = black, 1 = no shadow), as Babylon's setDarkness
-                  // y = 1 to rotate the page-marking sample through its stride cell each frame
+  shade: vec4f,   // x = darkness: light left in full shadow (0 = black, 1 = no shadow), as Babylon's setDarkness;
+                  // y = 1 when psMinMax is live for every valid page (the receiver's PCF early-out);
+                  // z = 1 to rotate the page-marking sample through its stride cell each frame (markRotate); w unused
   levels: array<PsLevel, PS_MAX_LEVELS>,
   regions: array<vec4f>, // world-space invalidation boxes as (min, max) pairs
 };
@@ -76,6 +80,7 @@ fn psInWindow(lv: PsLevel, page: vec2i, n: i32) -> bool {
  *   var<storage, read> psParams: PsParams;
  *   var<storage, read> psPageTable: array<vec2u>;
  *   var psPool: texture_depth_2d;
+ *   var psMinMax: texture_2d<u32>;   // PagedShadowCore.minMaxTexture
  * It is strictly read-only. Measured on Intel Xe-LPG: merely *containing* a
  * storage write, even one that never executes, disables early-Z for every
  * material that includes the receiver (+13 ms in a forest). Page requests are
@@ -94,15 +99,51 @@ fn psLookup(level: u32, page: vec2i) -> u32 {
   return (e.x & PS_PHYS_MASK) + 1u;
 }
 
-fn psFetch(level: u32, centerPage: vec2i, centerPhys: u32, t: vec2i) -> f32 {
+// The pages a PCF footprint that leaves its own page can touch: at most one
+// neighbour on each axis (the 4-texel footprint is narrower than a page), so
+// the x, y and diagonal neighbours are looked up once per fragment rather
+// than once per tap (up to 12 page-table reads before).
+struct PsNeighbours {
+  page: vec2i,   // the footprint's own page
+  other: vec2i,  // the neighbour page on each axis (== page where it stays inside)
+  x: u32,        // psLookup of (other.x, page.y), (page.x, other.y), other
+  y: u32,
+  xy: u32,
+};
+
+fn psNeighbours(level: u32, page: vec2i, local: vec2i, s: i32) -> PsNeighbours {
+  var nb: PsNeighbours;
+  nb.page = page;
+  nb.other = page + select(vec2i(0), vec2i(-1), local < vec2i(0)) + select(vec2i(0), vec2i(1), local + vec2i(3) >= vec2i(s));
+  nb.x = 0u;
+  nb.y = 0u;
+  nb.xy = 0u;
+  if (nb.other.x != page.x) { nb.x = psLookup(level, vec2i(nb.other.x, page.y)); }
+  if (nb.other.y != page.y) { nb.y = psLookup(level, vec2i(page.x, nb.other.y)); }
+  if (all(nb.other != page)) { nb.xy = psLookup(level, nb.other); }
+  return nb;
+}
+
+fn psFetch(level: u32, nb: PsNeighbours, centerPhys: u32, t: vec2i) -> f32 {
   let s = i32(psParams.pool.z);
   let page = vec2i(floor(vec2f(t) / f32(s)));
   var phys = centerPhys;
   var local = t - page * s;
-  if (any(page != centerPage)) {
-    let p = psLookup(level, page);
+  if (any(page != nb.page)) {
+    // One of the pre-looked-up neighbours; anything else (not reachable for
+    // pages of 4+ texels, kept so the result never depends on that) looks up.
+    var p: u32;
+    if (all(page == vec2i(nb.other.x, nb.page.y))) {
+      p = nb.x;
+    } else if (all(page == vec2i(nb.page.x, nb.other.y))) {
+      p = nb.y;
+    } else if (all(page == nb.other)) {
+      p = nb.xy;
+    } else {
+      p = psLookup(level, page);
+    }
     if (p == 0u) {
-      local = clamp(t - centerPage * s, vec2i(0), vec2i(s - 1));
+      local = clamp(t - nb.page * s, vec2i(0), vec2i(s - 1));
     } else {
       phys = p - 1u;
     }
@@ -163,6 +204,24 @@ fn psVisibility(posW: vec3f, normalW: vec3f) -> f32 {
           let row = psParams.pool.y;
           let phys = phys1 - 1u;
           let origin = vec2i(i32(phys % row) * si, i32(phys / row) * si) + local;
+          // Early-out: one min/max texel bounds every footprint starting in its
+          // MINMAX_TILE² tile (see minmax.ts). Every tap passes when z <= min, none when
+          // z > max, so PCF's answer is known without its 16 loads. Only the
+          // fast path: across pages the bounds would need every page touched.
+          if (psParams.shade.y > 0.5) {
+            let mm = textureLoad(psMinMax, origin / ${MINMAX_TILE}, 0).xy;
+            if (z > bitcast<f32>(mm.y)) { return 0.0; }
+            if (z <= bitcast<f32>(mm.x)) {
+              // The sum of the weights, added in the same order as the taps
+              // below, so the result is the very value full PCF would return.
+              for (var j = 0; j < 4; j++) {
+                var rowSum = 0.0;
+                for (var i = 0; i < 4; i++) { rowSum += wx[i]; }
+                sum += wy[j] * rowSum;
+              }
+              return sum / 9.0;
+            }
+          }
           for (var j = 0; j < 4; j++) {
             var rowSum = 0.0;
             for (var i = 0; i < 4; i++) {
@@ -171,10 +230,11 @@ fn psVisibility(posW: vec3f, normalW: vec3f) -> f32 {
             sum += wy[j] * rowSum;
           }
         } else {
+          let nb = psNeighbours(level, page, local, si);
           for (var j = 0; j < 4; j++) {
             var rowSum = 0.0;
             for (var i = 0; i < 4; i++) {
-              rowSum += wx[i] * select(0.0, 1.0, z <= psFetch(level, page, phys1 - 1u, base + vec2i(i, j)));
+              rowSum += wx[i] * select(0.0, 1.0, z <= psFetch(level, nb, phys1 - 1u, base + vec2i(i, j)));
             }
             sum += wy[j] * rowSum;
           }
