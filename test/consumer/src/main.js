@@ -200,8 +200,9 @@ try {
         sd.setCasters([...base, { mesh: posts, options: { instanceMatrices: postCanon } }]); await frames(30);
         const lumaPosts = await meanLuma();
         const calls = { box: 0, all: 0 };
-        const box0 = sd.core.invalidateBox.bind(sd.core), all0 = sd.core.invalidateAll.bind(sd.core);
-        sd.core.invalidateBox = (a, b) => { calls.box++; box0(a, b); };
+        // invalidateRange is where every per-box invalidation lands (invalidateBox and setInstanceMatrix).
+        const box0 = sd.core.invalidateRange.bind(sd.core), all0 = sd.core.invalidateAll.bind(sd.core);
+        sd.core.invalidateRange = (...a) => { calls.box++; box0(...a); };
         sd.core.invalidateAll = () => { calls.all++; all0(); };
         const builds0 = sd.core.contentSummary.builds;
         const moved = postCanon.slice();
@@ -211,7 +212,7 @@ try {
         await frames(20);
         const lumaMoved = await meanLuma();
         const rebuilt = sd.core.contentSummary.builds !== builds0;
-        sd.core.invalidateBox = box0; sd.core.invalidateAll = all0;
+        sd.core.invalidateRange = box0; sd.core.invalidateAll = all0;
         // An internal rebuild (addCaster after start) re-registers from the entries: the moved
         // member must stay moved. The dummy is hidden and casts below the ground.
         const internal0 = sd.core.contentSummary.internalBuilds;
