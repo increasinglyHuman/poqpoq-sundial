@@ -2,7 +2,7 @@ import "@babylonjs/core";
 // Loaded up front: the shadow generator imports these lazily, which this harness's Vite cannot serve.
 import "@babylonjs/core/ShadersWGSL/shadowMap.fragment.js";
 import "@babylonjs/core/ShadersWGSL/shadowMap.vertex.js";
-import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, Matrix, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, ShadowGenerator, Vector3, Color3 } from "@babylonjs/core";
+import { Engine, WebGPUEngine, Scene, FreeCamera, DirectionalLight, HemisphericLight, MeshBuilder, StandardMaterial, MultiMaterial, SubMesh, RawTexture, Material, Constants, Matrix, ImageProcessingPostProcess, PBRMaterial, MaterialPluginBase, ShadowGenerator, TransformNode, Vector3, Color3 } from "@babylonjs/core";
 import { SundialBabylon, readCoverage } from "@poqpoq/sundial/babylon";
 const r = (window.__result = { imported: true });
 try {
@@ -159,6 +159,47 @@ try {
         r.rebuildAdd = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
         sd.setCasters(base); extra.dispose(); await frames(20);
         r.rebuildRemove = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
+      }
+      // A moving dynamic caster's shadow follows it (updateDynamics skips casters whose world matrix
+      // provably did not change, so every way of moving one must still be seen). Hidden from the camera,
+      // so only its shadow changes the picture: it lands in the left half at A = (-5, y, -8) and in the
+      // right half at B = (5, y, -8); each half's mean luma says where it is, and that the old footprint
+      // was re-rendered clean. Moved three ways: through its parent, by its own position, and (thin) by
+      // editing the instance buffer in place.
+      {
+        const halves = async () => {
+          const w = engine.getRenderWidth(), h = engine.getRenderHeight();
+          const px = await engine.readPixels(0, 0, w, h);
+          let left = 0, right = 0;
+          for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+            const i = (y * w + x) * 4, l = px[i] + px[i + 1] + px[i + 2];
+            if (x < w / 2) left += l; else right += l;
+          }
+          const n = (w / 2) * h * 3;
+          return { left: left / n, right: right / n };
+        };
+        const base = [ground, box, { mesh: prim }, leaf];
+        await frames(10);
+        const clean = await halves();
+        const rig = new TransformNode("rig", scene);
+        const dyn = MeshBuilder.CreateBox("dyn", { size: 2 }, scene); dyn.isVisible = false; dyn.parent = rig; dyn.position.set(-5, 1.5, -8);
+        sd.setCasters([...base, { mesh: dyn, options: { dynamic: true } }]); await frames(20);
+        const atA = await halves();
+        rig.position.x = 10; await frames(20); // the parent moves: the caster is now at B
+        const viaParent = await halves();
+        dyn.position.x = -15; await frames(20); // its own position: back to A
+        const viaPosition = await halves();
+        sd.setCasters(base); dyn.dispose(); rig.dispose(); await frames(20);
+        const thin = MeshBuilder.CreateBox("dynThin", { size: 2 }, scene); thin.isVisible = false;
+        const buf = new Float32Array(16); Matrix.Translation(-5, 1.5, -8).copyToArray(buf, 0);
+        thin.thinInstanceSetBuffer("matrix", buf, 16, false);
+        sd.setCasters([...base, { mesh: thin, options: { dynamic: true } }]); await frames(20);
+        const thinA = await halves();
+        Matrix.Translation(5, 1.5, -8).copyToArray(buf, 0); thin.thinInstanceBufferUpdated("matrix"); await frames(20);
+        const thinB = await halves();
+        sd.setCasters(base); thin.dispose(); await frames(20);
+        const at = (hv, side) => (hv.left < clean.left - 0.05 && Math.abs(hv.right - clean.right) < 0.02 ? "A" : hv.right < clean.right - 0.05 && Math.abs(hv.left - clean.left) < 0.02 ? "B" : "?");
+        r.dynamicFollow = { atA: at(atA), viaParent: at(viaParent), viaPosition: at(viaPosition), thinA: at(thinA), thinB: at(thinB), clean, atA_: atA, viaParent_: viaParent, viaPosition_: viaPosition, thinA_: thinA, thinB_: thinB };
       }
       // Requests are per frame (review F1, PR #9): look at empty sky and the pages the ground asked
       // for must stop being requested. If the request buffer were never cleared they would stay.
