@@ -1,44 +1,110 @@
 <p align="center"><img src="docs/images/sundial-hero.jpg" alt="poqpoq Sundial" width="420"></p>
 
-# poqpoq-sundial — paged sun shadows for WebGPU
+# poqpoq Sundial — paged sun shadows for WebGPU
 
-A working virtual (paged) shadow map for one directional light, built for
-poqpoq World on Babylon.js 9 and WebGPU. Engine-agnostic core, thin Babylon
-adapter, procedural poqpoq-sized test world, and a live A/B against Babylon's
-`CascadedShadowGenerator` configured like World's `ShadowDirector` tiers.
+Sundial is a virtual (paged) shadow map for one directional light, written in
+TypeScript and WGSL for WebGPU. It has an engine-agnostic core that talks only
+to a `GPUDevice`, and a Babylon.js 9 adapter. It is the default shadow system
+of [poqpoq World](https://poqpoq.com/world/) on WebGPU.
+
+**Sharper shadows near the camera, and on integrated GPUs, a lower cost than
+Babylon's cascaded shadow maps.** Measured on an Intel Xe-LPG iGPU, a frame
+with Sundial is 25–32% faster than with `CascadedShadowGenerator` at 3×2048²,
+while its finest texels are 7.8 mm.
+
+## About
+
+### Why it exists
+
+Cascaded shadow maps (CSM) redraw every cascade whenever the camera or the sun
+moves, at a fixed resolution per cascade. On a discrete GPU that is affordable.
+On the integrated GPUs many players have, the redraw and the filtering are fill
+work. On poqpoq World's forest sims, vegetation shadows cost 46 ms of a 91 ms
+frame on an Intel iGPU, and the watchdog had to switch shadows off for
+integrated-GPU players.
+
+Sundial is built from the other direction:
+
+- **Draw once, keep it.** Shadow depth lives in 128×128 pages in a single
+  pool. A page is rendered when the camera first needs it and is then kept.
+  Static pages are never redrawn; moving casters dirty only the pages they
+  cross.
+- **Ask for what the screen needs.** Every frame, a compute pass reads the
+  camera's depth and requests, for each visible surface, the page at the level
+  whose texel size matches that surface's pixel footprint. Resolution follows
+  the viewer.
+- **Keep the GPU busy, not the CPU.** Marking, page management, culling and
+  rasterization all run on the GPU from one ~1 KB upload per frame, with three
+  indirect draws in total.
+- **Cheap receivers.** Materials read the pool with `textureLoad`: no
+  samplers, no writes, and they skip filtering entirely where a page's
+  min/max depth shows the whole footprint fully lit or fully shadowed.
+
+The idea comes from Unreal Engine 5's Virtual Shadow Maps and the adaptive
+shadow map research before it. Sundial is a from-scratch take on it for the
+web: no mesh shaders, no bindless, and no engine changes.
+
+### Status
+
+Version **0.1**. Running in production in poqpoq World since September 2026,
+on the default path for every WebGPU visitor; WebGL2 visitors keep CSM. The
+API may still change within 0.x (see [Limits](#limits-and-known-issues)).
+
+## Results
+
+The lab scene is a procedural 256 m sim: 1,400 alpha-tested trees, 133k-triangle
+terrain and a prim village, at 1600×900 with 4× MSAA. Each figure is the median
+of 5 interleaved rounds of 3 s each (`scripts/bench.mjs`, warm-up and flush
+pages, vsync off), taken 2026-09-23. The rounds agree within 0.1 ms except for
+CSM HIGH on NVIDIA.
+
+Frame time in ms (lower is better):
+
+| | Xe-LPG village | Xe-LPG overview | Xe-LPG forest | RTX 5060 village | RTX 5060 overview | RTX 5060 forest |
+|---|---|---|---|---|---|---|
+| shadows off | 3.82 | 3.92 | 4.82 | 0.77 | 0.89 | 0.55 |
+| CSM MEDIUM (3×2048²) | 10.50 | 9.78 | 8.80 | 3.38 | 3.01 | 2.86 |
+| CSM HIGH (4×4096²) | 17.74 | 17.01 | 14.85 | 8.82 | 9.25 | 6.39 |
+| **Sundial** | **7.12** | **7.30** | **6.12** | **2.13** | **2.43** | **1.53** |
+
+What shadows cost, over the shadows-off frame:
+
+| | Xe-LPG | RTX 5060 |
+|---|---|---|
+| CSM MEDIUM | 3.98–6.68 ms | 2.12–2.61 ms |
+| **Sundial** | **1.30–3.38 ms** | **0.98–1.54 ms** |
+
+In the field, on a busy poqpoq World community sim, the frame rate went from
+29 fps with CSM to 41 fps with Sundial.
+
+Most of Sundial's remaining cost is in the receivers (material shaders that
+sample the shadow). Producing static shadow depth is ~0.05 ms, and page marking
+is 0.03 ms on the RTX and 0.3–0.4 ms on the Xe-LPG.
+
+## Using it
 
 ```
-npm install
-npm run dev            # http://localhost:5188
-node scripts/bench.mjs # interleaved A/B on whatever GPU Chrome picks
+npm install @poqpoq/sundial @babylonjs/core
 ```
 
-## Using the package
+(The npm release is days away. Until then, clone, `npm run build`, and depend
+on it by path: `"@poqpoq/sundial": "file:../poqpoq-sundial"`.)
 
-`@poqpoq/sundial` ships as an ES module plus type declarations in `dist/`:
-the engine-agnostic core at `@poqpoq/sundial` and the Babylon.js adapter at
-`@poqpoq/sundial/babylon`, with `@babylonjs/core` (≥ 9.17.1) as a peer. Until
-it is on npm, build it and depend on it by path:
-
-```
-npm run build                       # → dist/index.js (core), dist/babylon.js (adapter)
-# in the consuming app's package.json:
-"@poqpoq/sundial": "file:../poqpoq-sundial"
-```
-
-The consumer should dedupe Babylon (`resolve.dedupe: ["@babylonjs/core"]` in
-Vite) so the adapter and the app share one Babylon runtime.
+`@poqpoq/sundial` is an ES module with type declarations: the engine-agnostic
+core at `@poqpoq/sundial` and the Babylon.js adapter at
+`@poqpoq/sundial/babylon`, with `@babylonjs/core` 9 (≥ 9.17.1) as a peer. Let
+your bundler dedupe Babylon (Vite: `resolve.dedupe: ["@babylonjs/core"]`) so
+the adapter and your app share one Babylon runtime.
 
 ```ts
 import { SundialBabylon } from "@poqpoq/sundial/babylon";
 
-// Importing is safe on every backend. Only construct on WebGPU;
-// keep the existing CascadedShadowGenerator on WebGL2.
+// Importing is safe on every backend. Only construct on WebGPU,
+// and keep a CascadedShadowGenerator for WebGL2.
 if (SundialBabylon.isSupported(engine)) {
   const sundial = new SundialBabylon(scene, sun, { sceneMin: [-128, -10, -128], sceneMax: [128, 60, 128] });
   sundial.addCaster(terrain);                                       // static
-  sundial.setAlphaMask(0, leafMaskCanvas, 0.5);
-  sundial.addCaster(leaves, { alphaLayer: 0, alphaCutoff: 0.5 });   // thin instances included
+  sundial.addCaster(leaves);                                        // alpha-tested: the mask is read from its material
   sundial.addCaster(windmill, { dynamic: true });                   // re-read every frame
   sundial.addCaster(swarm, { dynamic: true, capacity: 64 });        // thin-instance count may vary up to 64
   sundial.addReceivers(materials);                                  // meshes also need receiveShadows
@@ -46,29 +112,45 @@ if (SundialBabylon.isSupported(engine)) {
 }
 ```
 
-`sundial.core.stats` holds the page counters (requested, resident, rendered,
-allocation failures, pairs), read back every `core.statsInterval` frames (10).
-GPU pass times (`gpuMarkMs`, `gpuComputeMs`, `gpuRasterMs`) need
-`sundial.core.profiling = true`: with it every pass writes timestamps and every
-frame resolves and maps them, work a shipping app should not pay for, so it is
-off by default and those fields are null. A status panel that shows them turns
-profiling on while it is open.
+- **Casters.** Static casters are uploaded once. Thin instances are supported.
+  Alpha-tested materials cast through their own alpha-test texture at their
+  `alphaCutOff`, like Babylon's `ShadowGenerator`; pass `alphaLayer` with
+  `setAlphaMask` to supply a mask yourself. `setCasters(entries)` replaces the
+  whole set; unchanged geometry is recognised and not rebuilt.
+- **Moving a few static instances.** `updateCasterMatrices(mesh, matrices)`
+  rewrites only the instances whose matrices changed and re-renders only the
+  pages under their old and new footprints. It returns `false` if the instance
+  count changed; call `setCasters` then.
+- **Receivers.** `addReceivers` attaches a plugin to StandardMaterial and
+  PBRMaterial (WGSL). Materials created after `start()` receive automatically;
+  `receiveNewMaterials` filters that.
+- **Look.** `setDarkness(d)` works like `ShadowGenerator.setDarkness`.
+  `sundial.core.tuning` holds `lodBias`, `normalOffset`, `depthBias` and
+  `debugMode` (1 tints each level).
+- **Lifecycle.** `setEnabled(false)` turns receivers off without freeing
+  anything. `setSceneBounds` handles a world that grows. `dispose()` frees
+  every GPU resource.
+- **Stats.** `sundial.core.stats` holds page counters (requested, resident,
+  rendered, allocation failures, pairs), read back every `core.statsInterval`
+  frames. GPU pass times need `core.profiling = true`, which costs a
+  timestamp resolve every frame, so it is off by default.
 
-Don't also attach a shadow generator to the same light. `npm run test:consumer`
-builds the package, installs it into `test/consumer/` exactly as above, and
-checks in real Chrome that the import is harmless on WebGL2 and that shadows
-run on WebGPU.
+A `ShadowGenerator` can share the light for casters Sundial doesn't cover
+(poqpoq World keeps a small CSM for skinned avatars). The receiver folds its
+factor into Babylon's with `min()`, so overlapping shadows never darken twice.
+Just don't give both the same casters.
 
-URL knobs: `mode=sundial|csm|off`, `tier=medium|high`, `el`, `az`, `speed`
-(sun °/s), `debug=1` (tint by level), `lodBias`, `budget`, `stride`,
-`cam=x,y,z,tx,ty,tz`, `animate=0`, `trees=N`, `rx=onetap|bilinear|nolookup`
-(receiver cost probes), `profile=0` (no GPU timestamps; the lab profiles by
-default).
+**The core without Babylon.** `PagedShadowCore` takes a `GPUDevice`, geometry
+(positions, indices, optional UVs and alpha layer), instance matrices, and per
+frame the eye, sun direction, and the camera's depth texture with its
+inverse view-projection matrix. It exports its receiver WGSL (`COMMON_WGSL`,
+`RECEIVER_WGSL`) for your own materials. The Babylon adapter is the worked
+example; a three.js adapter is planned.
 
 ## How it works
 
 A clipmap of 7 levels, 16×16 pages each, 128² texels per page; level 0 is
-16 m across (7.8 mm texels), each level doubles. Pages live in one 4096²
+16 m across (7.8 mm texels), and each level doubles. Pages live in one 4096²
 `depth32float` pool (1,024 pages, 64 MiB). Addressing is toroidal, so a
 walking camera only exposes a strip of new pages.
 
@@ -78,60 +160,22 @@ Every frame, on the GPU, from one ~1 KB params upload:
 |---|---|
 | mark | compute over last frame's camera depth: each visible surface requests the page at the level whose texels match its pixel footprint |
 | manage | retag scrolled slots, dirty pages under moving casters, collect free / old / recent physical pages, allocate (LRU), build the render list |
-| cull | every cluster instance × every page being rendered → (cluster, page) pairs |
+| cull | every cluster instance × every page being rendered → (cluster, page) pairs; clusters are 64-triangle Morton-ordered runs with their own bounds |
 | raster | **one** clear draw + **one** opaque draw + **one** alpha-tested draw, all indirect; vertex pulling places each triangle in its page's atlas rectangle, clip distances trim it to the page |
 
-Static pages are never redrawn. The sun is handled per level: each level
-keeps the light basis it was rendered with and re-renders only when the sun
-has drifted past its band (`bandDegrees × 2^level`), one level per frame at
-most, so a moving sun costs a trickle of fine-level refreshes instead of a
-full redraw.
+The sun is handled per level: each level keeps the light basis it was rendered
+with and re-renders only when the sun has drifted past its band
+(`bandDegrees × 2^level`), one level per frame at most. A moving sun costs a
+trickle of fine-level refreshes instead of a full redraw.
 
 Receivers are injected into Standard and PBR materials at
 `CUSTOM_LIGHT{k}_COLOR` (plus a per-light regex for StandardMaterial's
 specular). They read the page table from a storage buffer and the pool with
-`textureLoad`: **no samplers are added**, and they are strictly read-only.
+`textureLoad`: **no samplers are added**, and they are strictly read-only. A
+per-page min/max depth atlas lets 60–79% of receiver fragments skip PCF with
+byte-identical output.
 
-## Results
-
-Procedural 256 m sim: 1,400 alpha-tested trees, 133k-triangle terrain, a
-prim village, 1600×900 with 4× MSAA. Milliseconds per frame (throughput),
-medians of interleaved rounds with warm-up and flush pages. Lower is better.
-
-| | RTX 5060 village | RTX 5060 forest | Xe-LPG village | Xe-LPG forest |
-|---|---|---|---|---|
-| shadows off | 0.73 | 0.54 | 3.55 | 3.04 |
-| CSM MEDIUM (3×2048²) | 3.38 | 2.85 | 9.41 | 7.89 |
-| CSM HIGH (4×4096²) | 10.99 | 5.99 | 15.48 | 12.93 |
-| **Sundial** | **2.63** | **1.88** | **6.80** | **6.06** |
-| **Sundial + leaf prepass** | **1.93** | **1.57** | **5.49** | **5.14** |
-
-The prepass rows come from a separate run; the other rows are from one run
-per GPU.
-
-Static shadow-map production is ~0.05 ms (page management 0.03 ms, raster
-0.02 ms); page marking is 0.03 ms on the RTX and 0.3–0.4 ms on the Xe-LPG.
-With a moving sun, moving casters and a camera walking at 5 m/s all at
-once, the Xe-LPG frame stays at ~7.05 ms while CSM MEDIUM rises to ~10.75 ms.
-
-**Leaf prepass** = `needDepthPrePass` on the one thin-instanced leaf mesh:
-one extra draw call, pixel-identical output, and no leaf overdraw left for
-the receiver to pay for. On StandardMaterial with
-`transparencyMode = MATERIAL_ALPHATEST` this needs
-`DepthPrePassAlphaTestFix` (below).
-
-## A Babylon bug, and its fix
-
-`src/babylon/DepthPrePassAlphaTestFix.ts`. In Babylon 9.17.1,
-StandardMaterial (GLSL and WGSL) with `transparencyMode = MATERIAL_ALPHATEST`
-defines `ALPHATEST_AFTERALLALPHACOMPUTATIONS`, which moves the alpha test to
-the end of the shader. The `needDepthPrePass` variant returns before the
-test, so the prepass writes the depth of whole leaf quads and punches holes in
-the scene. The plugin alpha-tests at `CUSTOM_FRAGMENT_UPDATE_ALPHA` in the
-prepass variant only. PBR, and StandardMaterial on the legacy
-`diffuseTexture.hasAlpha` path, are unaffected.
-
-## Rulings learned the hard way (measured on Intel Xe-LPG)
+### Rulings learned the hard way (measured on Intel Xe-LPG)
 
 1. **Receivers must not write.** A storage write in a material shader, even
    one that never executes, disables early-Z for the whole draw: +13 ms in the
@@ -140,9 +184,7 @@ prepass variant only. PBR, and StandardMaterial on the legacy
    `transparencyMode = MATERIAL_ALPHATEST` discards at the *end* of the
    shader, after all lighting, so every transparent leaf texel paid for the
    full receiver first. Guarding the receiver on the alpha test took the
-   village view from 24 to 6.8 ms. (An earlier explanation, Tint's
-   demote-to-helper, was wrong: on the legacy early-discard path, gating
-   measured no gain at all, on either GPU.)
+   village view from 24 to 6.8 ms.
 3. **PCF without arrays.** 3×3 bilinear PCF over a 4×4 footprint collapses to
    separable weights (1−f, 1, 1, f); a dynamically indexed 4×4 array spilled on
    Intel and cost ~45 ms.
@@ -150,25 +192,88 @@ prepass variant only. PBR, and StandardMaterial on the legacy
    leaves the iGPU in a slow transient (same page measured 23.8 vs 6.8 ms).
    `bench.mjs` warms every mode and loads a cheap page before every run.
 
-## Seams into Babylon (quarantined in `src/babylon/SundialBabylon.ts`)
+### Seams into Babylon
 
-- `engine._device` — the core runs on Babylon's own `GPUDevice`, from its own
+All quarantined in `src/babylon/SundialBabylon.ts`. Some are private Babylon
+API, which is why the peer range is pinned to Babylon 9.
+
+- `engine._device`: the core runs on Babylon's own `GPUDevice`, from its own
   command encoder, submitted before Babylon's frame. Babylon only samples the
-  result, so the shadow pass is outside any snapshot bundle by construction.
-- `engine._depthTexture` plus a `createTexture` patch that adds
-  `TEXTURE_BINDING` to Babylon's main depth buffer, so marking can read it.
-  The one real patch; an upstream option would retire it.
-- `_thinInstanceDataStorage.matrixData` — the thin-instance buffer Babylon
-  renders from. The public `thinInstanceGetWorldMatrices()` caches its
-  matrices on first call and goes stale after buffer edits.
+  result, so the shadow pass sits outside any snapshot bundle by construction.
+- A `createTexture` patch on that device adds `TEXTURE_BINDING` to depth
+  textures, so marking can read the camera's depth. The depth comes from the
+  camera's output render target, else its first post-process input, else the
+  engine's main depth buffer. An upstream option would retire the patch.
+- `_thinInstanceDataStorage.matrixData`: the thin-instance buffer Babylon
+  renders from. The public `thinInstanceGetWorldMatrices()` caches on first
+  call and goes stale after buffer edits.
 - `wrapWebGPUTexture` (public) for the pool; `WebGPUDataBuffer` for storage
   buffer bindings.
 
-## Not done yet
+### Upstream Babylon fixes
 
-- Skinned casters (the core pulls rigid geometry; avatars would go through
-  the adapter as a dynamic layer).
-- Double-buffered level refresh, so a sun-band refresh never falls back a level.
-- Level cross-fade; page-border-aware PCF for the rare cross-page footprint.
-- A three.js adapter (`ShadowBaseNode` subclass), per the research plan.
-- Pulling World's real content (terrain splat plugin composition, OAR prims).
+Sundial's work turned up two Babylon bugs, fixed upstream and approved by the
+Babylon team, awaiting merge:
+
+- **StandardMaterial alpha test in the depth pre-pass** (BabylonJS/Babylon.js
+  #18936). With `transparencyMode = MATERIAL_ALPHATEST`, `needDepthPrePass`
+  wrote the depth of whole alpha-tested quads and punched holes in the scene.
+  Until it ships, `DepthPrePassAlphaTestFix` (exported from the adapter) is a
+  material plugin that fixes it locally. A depth pre-pass on leaf meshes is
+  the cheapest receiver win there is: one draw, identical pixels, no leaf
+  overdraw left for the receiver to pay for.
+- **Atmosphere plugin scope** (#18934). The atmosphere add-on registered its
+  PBR material plugin globally, so PBR materials in other engines and scenes
+  got a plugin bound to the wrong atmosphere.
+
+## Limits and known issues
+
+- **WebGPU only.** On WebGL2, keep a `CascadedShadowGenerator`;
+  `SundialBabylon.isSupported(engine)` tells you which.
+- **One directional light.** Point and spot lights are out of scope.
+- **Receivers:** StandardMaterial and PBRMaterial in WGSL. Node materials and
+  custom shaders need the exported WGSL wired in by hand.
+- **Skinned meshes don't cast yet.** Skinning in the caster vertex shader is
+  planned; until then keep a small CSM for avatars (the `min()` fold above
+  makes the two coexist).
+- **Known bug:** a receiver beyond the shadow depth range (a far sea past the
+  scene bounds) reads as shadowed. Keep `sceneMin`/`sceneMax` around
+  everything that receives. A clamp is next on the list.
+- **Memory:** the pool is 64 MiB at the defaults (`poolSize`, `pageSize`).
+- **Private Babylon API** (see Seams): a Babylon upgrade can break the adapter.
+  Babylon 9.17.1 is tested.
+
+Planned: static/dynamic page separation (a moving caster stops dirtying
+static depth), skinned casters, level cross-fade, a three.js adapter, and a
+screen-space shadow mask as an engine-agnostic receiver.
+
+## Development
+
+```
+npm install
+npm run dev              # the lab: http://localhost:5188
+node scripts/bench.mjs   # interleaved A/B; GPU=nvidia for the discrete GPU
+npm run test:consumer    # builds the package, installs it into test/consumer,
+                         # checks it in real Chrome on WebGL2 and WebGPU
+```
+
+Lab URL knobs: `mode=sundial|csm|off`, `tier=medium|high`, `el`, `az`,
+`speed` (sun °/s), `debug=1` (tint by level), `lodBias`, `budget`, `stride`,
+`cam=x,y,z,tx,ty,tz`, `animate=0`, `trees=N`, `rx=onetap|bilinear|nolookup`
+(receiver cost probes), `profile=0` (no GPU timestamps; the lab profiles by
+default).
+
+## Credits
+
+Designed and directed by Allen Partridge ([p0qp0q](https://poqpoq.com)) for
+poqpoq World. Implemented with Claude (Anthropic) as the coding partner, with
+code reviews by Codex (OpenAI). Thanks to the Babylon.js team for reviewing
+the upstream fixes, and to the players whose field runs set the targets.
+
+Built on ideas from Unreal Engine 5's Virtual Shadow Maps, Fernando et al.'s
+*Adaptive Shadow Maps* (2001), and Lefohn et al.'s *Resolution-Matched Shadow
+Maps* (2007).
+
+## License
+
+MIT © 2026 Allen Partridge (p0qp0q)
