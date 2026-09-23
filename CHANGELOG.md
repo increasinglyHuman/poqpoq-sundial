@@ -4,6 +4,27 @@ All notable changes to `@poqpoq/sundial`. The project follows
 [semantic versioning](https://semver.org/); while it is 0.x, a minor version
 may change the API.
 
+## Unreleased
+
+### Core
+
+- **Static cache** (`staticCache`, default on): static casters render into a
+  second pool that keeps each page's static-only depth. A moving dynamic
+  caster no longer invalidates the pages it crosses: they are re-composed
+  from that pool (a quad per page) and only the dynamic casters are redrawn,
+  instead of every static caster on them. `dynamicBudget` (default 64) caps
+  re-composed pages per frame. Costs a second pool texture (64 MiB at the
+  defaults); `staticCache: false` keeps the single-pool behaviour.
+- New stats: `dynamicPages`, `dynamicDeferred`, `compositedPages`,
+  `dynamicPairs`; `contentSummary.dynamicClusterInstances`.
+- Static invalidation regions are capped at 128 per frame with the cache (the
+  dynamic regions take the other half); past that, boxes merge as before.
+
+### Lab
+
+- `?cache=0`, `?dynBudget=N`, `?movers=N` (walkers through the forest), and
+  `?t=` / `?stopAt=` to start and freeze the movers' clock.
+
 ## 0.1.0 — 2026-09-23
 
 First public release. Sundial has been poqpoq World's default shadow system

@@ -16,25 +16,31 @@ export function rasterWGSL(w: WorkLayout, maxPairs: number, useClipDistances: bo
   // With clip distances the opaque pipeline has no fragment stage, so its
   // vertex stage outputs only what the rasterizer needs: no UVs, no alpha
   // record, no page UV (the discard fallback and the alpha pipeline keep them).
-  const opaqueVS = useClipDistances
-    ? `struct OpaqueOut {
-  @builtin(position) pos: vec4f,
-  @builtin(clip_distances) clip: array<f32, 4>,
-};
-
-@vertex
-fn opaqueVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> OpaqueOut {
-  let v = casterVertex(vi, ii);
+  // `pair` is the pair index for instance ii: static pairs count up from the
+  // front of each list, dynamic ones (the static cache) down from its end.
+  const opaqueEntry = (name: string, pair: string) =>
+    useClipDistances
+      ? `@vertex
+fn ${name}(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> OpaqueOut {
+  let v = casterVertex(vi, ${pair});
   var out: OpaqueOut;
   out.pos = v.pos;
   out.clip = array<f32, 4>(v.pageUv.x, 1.0 - v.pageUv.x, v.pageUv.y, 1.0 - v.pageUv.y);
   if (v.vtx == PS_NONE) { out.clip = array<f32, 4>(-1.0, -1.0, -1.0, -1.0); }
   return out;
 }`
-    : `@vertex
-fn opaqueVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {
-  return caster(vi, ii);
+      : `@vertex
+fn ${name}(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {
+  return caster(vi, ${pair});
 }`;
+  const opaqueVS = `${useClipDistances ? `struct OpaqueOut {
+  @builtin(position) pos: vec4f,
+  @builtin(clip_distances) clip: array<f32, 4>,
+};` : ""}
+
+${opaqueEntry("opaqueVS", "ii")}
+
+${opaqueEntry("opaqueDynamicVS", "MAX_PAIRS - 1u - ii")}`;
   const clipTest = useClipDistances
     ? ""
     : "if (any(in.pageUv < vec2f(0.0)) || any(in.pageUv > vec2f(1.0))) { discard; }";
@@ -52,6 +58,8 @@ ${COMMON_WGSL}
 @group(0) @binding(7) var<storage, read> indices: array<u32>;
 @group(0) @binding(8) var alphaTex: texture_2d_array<f32>;
 @group(0) @binding(9) var alphaSampler: sampler;
+// Static cache only, and only in the pass that writes the live pool.
+@group(1) @binding(0) var staticPool: texture_depth_2d;
 
 ${SCENE_WGSL}
 
@@ -86,6 +94,15 @@ fn clearVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let corners = array<vec2f, 6>(vec2f(0, 0), vec2f(1, 0), vec2f(0, 1), vec2f(0, 1), vec2f(1, 0), vec2f(1, 1));
   let atlas = info.atlasOrigin + corners[vi] * f32(psParams.pool.z);
   return vec4f(atlasToClip(atlas), 1.0, 1.0);
+}
+
+// ---- static cache composite ----------------------------------------------
+// clearVS places the quad over the page; both pools lay pages out alike, so
+// the fragment's own position addresses the page's static depth.
+
+@fragment
+fn compositeFS(@builtin(position) p: vec4f) -> @builtin(frag_depth) f32 {
+  return textureLoad(staticPool, vec2i(p.xy), 0);
 }
 
 // ---- casters --------------------------------------------------------------
@@ -154,6 +171,11 @@ ${opaqueVS}
 @vertex
 fn alphaVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {
   return caster(vi, MAX_PAIRS + ii);
+}
+
+@vertex
+fn alphaDynamicVS(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CasterOut {
+  return caster(vi, MAX_PAIRS * 2u - 1u - ii);
 }
 
 @fragment

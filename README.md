@@ -116,6 +116,15 @@ if (SundialBabylon.isSupported(engine)) {
   `alphaCutOff`, like Babylon's `ShadowGenerator`; pass `alphaLayer` with
   `setAlphaMask` to supply a mask yourself. `setCasters(entries)` replaces the
   whole set; unchanged geometry is recognised and not rebuilt.
+- **Dynamic casters.** `dynamic: true` casters are re-read every frame. With
+  the static cache (the default, `staticCache: true`), a dynamic caster that
+  moves only redraws itself: the pages it crossed get their cached static
+  depth copied back and the dynamic casters drawn over it, instead of
+  re-rendering every tree on them. Up to `dynamicBudget` pages (default 64,
+  also `core.tuning.dynamicBudget`) are re-composed per frame; the rest fall
+  back a level for a frame. The cache costs a second pool (64 MiB at the
+  defaults); `staticCache: false` drops it, and a moving dynamic caster then
+  re-renders the pages under its old and new bounds, as a static edit does.
 - **Moving a few static instances.** `updateCasterMatrices(mesh, matrices)`
   rewrites only the instances whose matrices changed and re-renders only the
   pages under their old and new footprints. It returns `false` if the instance
@@ -130,7 +139,9 @@ if (SundialBabylon.isSupported(engine)) {
   anything. `setSceneBounds` handles a world that grows. `dispose()` frees
   every GPU resource.
 - **Stats.** `sundial.core.stats` holds page counters (requested, resident,
-  rendered, allocation failures, pairs), read back every `core.statsInterval`
+  rendered, allocation failures, pairs; with the static cache also
+  `dynamicPages`, `dynamicDeferred`, `compositedPages` and `dynamicPairs`,
+  while `renderedPages` counts static renders), read back every `core.statsInterval`
   frames. GPU pass times need `core.profiling = true`, which costs a
   timestamp resolve every frame, so it is off by default.
 
@@ -150,17 +161,34 @@ example; a three.js adapter is planned.
 
 A clipmap of 7 levels, 16×16 pages each, 128² texels per page; level 0 is
 16 m across (7.8 mm texels), and each level doubles. Pages live in one 4096²
-`depth32float` pool (1,024 pages, 64 MiB). Addressing is toroidal, so a
-walking camera only exposes a strip of new pages.
+`depth32float` pool (1,024 pages, 64 MiB), which receivers read, plus a
+second one of the same layout that caches each page's static-only depth (the
+static cache; another 64 MiB). Addressing is toroidal, so a walking camera
+only exposes a strip of new pages.
 
 Every frame, on the GPU, from one ~1 KB params upload:
 
 | Pass | What |
 |---|---|
 | mark | compute over last frame's camera depth: each visible surface requests the page at the level whose texels match its pixel footprint |
-| manage | retag scrolled slots, dirty pages under moving casters, collect free / old / recent physical pages, allocate (LRU), build the render list |
-| cull | every cluster instance × every page being rendered → (cluster, page) pairs; clusters are 64-triangle Morton-ordered runs with their own bounds |
-| raster | **one** clear draw + **one** opaque draw + **one** alpha-tested draw, all indirect; vertex pulling places each triangle in its page's atlas rectangle, clip distances trim it to the page |
+| manage | retag scrolled slots, mark pages under moving dynamic casters stale and dirty pages under static edits, collect free / old / recent physical pages, allocate (LRU), build the static render list, then the dynamic list (stale pages) |
+| cull | dynamic cluster instances × every page drawn, then static cluster instances × the static list → (cluster, page) pairs; clusters are 64-triangle Morton-ordered runs with their own bounds |
+| raster | into the static pool: **one** clear draw + **one** opaque draw + **one** alpha-tested draw; into the live pool: **one** composite draw (a quad per page copying its static depth) + the same two draws for dynamic casters; all indirect. Vertex pulling places each triangle in its page's atlas rectangle, clip distances trim it to the page |
+
+**Static cache.** A page is rendered from scratch (static casters into the
+static pool) only when static content changes under it: allocation, a scroll,
+a sun-band refresh, a static edit. A dynamic caster that moves queues its old
+and new bounds; every valid page they touch turns *stale*: its static depth is
+still good, only the dynamic part is not. Stale pages form a second list,
+coarsest level first, capped by `dynamicBudget`. Every page drawn in a frame,
+from either list, is composited into the live pool (depth textures cannot be
+copied by sub-rectangle, so a quad per page writes `frag_depth`) and then gets
+the dynamic casters that overlap it drawn over it. A walker in the forest
+thus costs a copy and a capsule per page instead of 1,400 alpha-tested trees.
+The min/max atlas is rebuilt for every page drawn. A stale page is not valid
+(receivers fall back a level) until it is re-composed, which is the same
+frame while the budget holds. With `staticCache: false` there is one pool and
+a moving dynamic caster dirties its pages like a static edit.
 
 The sun is handled per level: each level keeps the light basis it was rendered
 with and re-renders only when the sun has drifted past its band
@@ -238,12 +266,12 @@ Babylon team, awaiting merge:
 - **Known bug:** a receiver beyond the shadow depth range (a far sea past the
   scene bounds) reads as shadowed. Keep `sceneMin`/`sceneMax` around
   everything that receives. A clamp is next on the list.
-- **Memory:** the pool is 64 MiB at the defaults (`poolSize`, `pageSize`).
+- **Memory:** the pool is 64 MiB at the defaults (`poolSize`, `pageSize`),
+  and the static cache doubles that to 128 MiB (`staticCache: false` saves it).
 - **Private Babylon API** (see Seams): a Babylon upgrade can break the adapter.
   Babylon 9.17.1 is tested.
 
-Planned: static/dynamic page separation (a moving caster stops dirtying
-static depth), skinned casters, level cross-fade, a three.js adapter, and a
+Planned: skinned casters, level cross-fade, a three.js adapter, and a
 screen-space shadow mask as an engine-agnostic receiver.
 
 ## Development

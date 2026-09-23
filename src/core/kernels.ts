@@ -12,6 +12,12 @@ export const C_ALPHA_PAIRS = 7;
 export const C_RESIDENT = 8;
 export const C_REQUESTED = 9;
 export const C_DEFERRED = 10;
+/** Pages the dynamic list took this frame (before dynamicBudget), and the ones it deferred. */
+export const C_DYN_PAGES = 11;
+export const C_DYN_DEFERRED = 12;
+/** (dynamic cluster instance, page) pairs; stored from the END of each pair list, downwards. */
+export const C_DYN_OPAQUE_PAIRS = 13;
+export const C_DYN_ALPHA_PAIRS = 14;
 /** Scalar counters: the ones cleared every frame and read back for stats. */
 export const COUNTER_COUNT = 16;
 /**
@@ -38,8 +44,18 @@ export interface WorkLayout {
   physOwner: number;
   physLastUsed: number;
   lists: number; // free | old | recent, pageCount each
+  /**
+   * The pages drawn this frame: the static list first (S pages, renderBudget at
+   * most), then, with the static cache, the dynamic list after it.
+   */
   renderList: number;
-  indirect: number; // clear, opaque, alpha draw args: 4 u32 each
+  /**
+   * Draw args, 4 u32 each: clear, opaque, alpha (the static casters, S pages),
+   * then composite, dynamic opaque, dynamic alpha (the static cache). Word 13,
+   * the composite's instance count, is the number of pages drawn this frame
+   * (S, or S + D with the cache); the min/max build reads it.
+   */
+  indirect: number;
   /**
    * The cull's dispatchWorkgroupsIndirect args (3 u32), written by
    * finalizeRenderList. The work buffer is bound writable in the paging pass,
@@ -50,15 +66,15 @@ export interface WorkLayout {
   total: number;
 }
 
-export function workLayout(slots: number, pages: number, renderBudgetMax: number): WorkLayout {
+export function workLayout(slots: number, pages: number, renderListMax: number): WorkLayout {
   const slotState = 0;
   const slotRender = slotState + slots;
   const physOwner = slotRender + slots;
   const physLastUsed = physOwner + pages;
   const lists = physLastUsed + pages;
   const renderList = lists + pages * 3;
-  const indirect = renderList + renderBudgetMax;
-  const dispatch = indirect + 12;
+  const indirect = renderList + renderListMax;
+  const dispatch = indirect + 24;
   return { slotState, slotRender, physOwner, physLastUsed, lists, renderList, indirect, dispatch, total: dispatch + 4 };
 }
 
@@ -108,6 +124,12 @@ const W_INDIRECT: u32 = ${w.indirect}u;
 const W_DISPATCH: u32 = ${w.dispatch}u;
 const C_LEVEL_RECT: u32 = ${C_LEVEL_RECT}u;
 const MAX_PAIRS: u32 = ${maxPairs}u;
+// Static cache: the page's live depth is out of date where dynamic casters
+// moved, but its static depth (staticPool) is good. Such a page is not valid
+// (receivers fall back) until the dynamic list composites it and redraws the
+// dynamic casters over it, the same frame when the budget allows. Kernel-only:
+// receivers test PS_VALID alone.
+const PS_STALE: u32 = 0x40000u;
 
 fn slotCount() -> u32 { return psParams.grid.x * psParams.grid.y * psParams.grid.y; }
 
@@ -132,6 +154,46 @@ fn pageRect(lv: PsLevel, c: vec3f, e: vec3f, n: i32) -> vec4i {
   return pageRectLs(lv, cxy, vec2f(dot(e, abs(lv.right.xyz)), dot(e, abs(lv.up.xyz))), n);
 }
 
+// Static cache values the host packs into levels[0].flags (y, z, w are unused
+// by every level otherwise): the dynamic invalidation regions (after the
+// static ones in psParams.regions), the dynamic page budget, and the first
+// dynamic cluster instance (dynamic cluster instances come last; without the
+// cache, or without dynamic casters, this is the cluster instance count).
+fn dynRegionCount() -> u32 { return psParams.levels[0].flags.y; }
+fn dynBudget() -> u32 { return psParams.levels[0].flags.z; }
+fn dynFirst() -> u32 { return psParams.levels[0].flags.w; }
+
+// A cluster instance as an oriented box: world centre and half axes.
+struct PsBox { c: vec3f, a0: vec3f, a1: vec3f, a2: vec3f };
+
+fn clusterBox(cl: PsCluster, m: PsInstance) -> PsBox {
+  let lc = (cl.aabbMin + cl.aabbMax) * 0.5;
+  let le = (cl.aabbMax - cl.aabbMin) * 0.5;
+  var b: PsBox;
+  b.c = vec3f(dot(m.r0.xyz, lc) + m.r0.w, dot(m.r1.xyz, lc) + m.r1.w, dot(m.r2.xyz, lc) + m.r2.w);
+  // The transformed cluster box is an oriented box with these half axes.
+  // Projecting it straight onto each level's light axes is its exact extent;
+  // going through a world AABB first inflated it twice.
+  b.a0 = vec3f(m.r0.x, m.r1.x, m.r2.x) * le.x;
+  b.a1 = vec3f(m.r0.y, m.r1.y, m.r2.y) * le.y;
+  b.a2 = vec3f(m.r0.z, m.r1.z, m.r2.z) * le.z;
+  return b;
+}
+
+// The page rect (clamped to the window) a cluster box covers at one level.
+fn boxPageRect(b: PsBox, lv: PsLevel, n: i32) -> vec4i {
+  let ax = lv.right.xyz;
+  let ay = lv.up.xyz;
+  // Exact support of the box, plus 1/1000 of a page so f32 rounding (the
+  // vertex stage transforms in another order) can never shave a triangle off
+  // a page it reaches: 1/8 texel at 128 texels a page, while a triangle must
+  // reach half a texel into a page to cover a sample there.
+  let pad = 1e-3 * lv.right.w;
+  let h = vec2f(abs(dot(ax, b.a0)) + abs(dot(ax, b.a1)) + abs(dot(ax, b.a2)),
+                abs(dot(ay, b.a0)) + abs(dot(ay, b.a1)) + abs(dot(ay, b.a2))) + vec2f(pad);
+  return pageRectLs(lv, vec2f(dot(b.c, ax), dot(b.c, ay)), h, n);
+}
+
 // K1: retag scrolled slots, apply level invalidation, gather requests.
 @compute @workgroup_size(64)
 fn updateSlots(@builtin(global_invocation_id) gid: vec3u) {
@@ -145,7 +207,7 @@ fn updateSlots(@builtin(global_invocation_id) gid: vec3u) {
 
   var e = psPageTable[idx];
   if (lv.flags.x != 0u || e.y != tag) {
-    e.x = e.x & ~PS_VALID;
+    e.x = e.x & ~(PS_VALID | PS_STALE);
     e.y = tag;
   }
   var requested = psRequests[idx] != 0u;
@@ -178,7 +240,33 @@ fn invalidateRegions(@builtin(global_invocation_id) gid: vec3u) {
   for (var y = rect.y; y <= rect.w; y++) {
     for (var x = rect.x; x <= rect.z; x++) {
       let s = psSlotIndex(level, x, y, u32(n));
-      psPageTable[s].x = psPageTable[s].x & ~PS_VALID;
+      psPageTable[s].x = psPageTable[s].x & ~(PS_VALID | PS_STALE);
+    }
+  }
+}
+
+// K2d (static cache): dynamic casters moved. Their old and new bounds come as
+// regions after the static ones; every valid page they touch keeps its static
+// depth and only needs its dynamic casters redrawn: mark it stale. Runs before
+// invalidateRegions, so a page a static edit also touched ends up needing a
+// full render (that kernel clears PS_STALE with PS_VALID).
+@compute @workgroup_size(64)
+fn markDynamicRegions(@builtin(global_invocation_id) gid: vec3u) {
+  let nl = psParams.grid.x;
+  let r = gid.x / nl;
+  let level = gid.x % nl;
+  if (r >= dynRegionCount()) { return; }
+  let k = psParams.misc.x + r;
+  let lo = psParams.regions[k * 2u].xyz;
+  let hi = psParams.regions[k * 2u + 1u].xyz;
+  let n = i32(psParams.grid.y);
+  let rect = pageRect(psParams.levels[level], (lo + hi) * 0.5, (hi - lo) * 0.5, n);
+  for (var y = rect.y; y <= rect.w; y++) {
+    for (var x = rect.x; x <= rect.z; x++) {
+      let s = psSlotIndex(level, x, y, u32(n));
+      let e = psPageTable[s].x;
+      // Every writer stores the same bits, so overlapping regions do not race.
+      if ((e & PS_VALID) != 0u) { psPageTable[s].x = (e & ~PS_VALID) | PS_STALE; }
     }
   }
 }
@@ -259,7 +347,8 @@ fn buildRenderListFine(@builtin(global_invocation_id) gid: vec3u) {
 fn listPage(idx: u32) {
   if (idx >= slotCount() || work[W_SLOT_STATE + idx] == 0u) { return; }
   let e = psPageTable[idx];
-  if ((e.x & PS_MAPPED) == 0u || (e.x & PS_VALID) != 0u) { return; }
+  // A stale page's static depth is good: the dynamic list takes it.
+  if ((e.x & PS_MAPPED) == 0u || (e.x & (PS_VALID | PS_STALE)) != 0u) { return; }
   let r = atomicAdd(&counters[${C_RENDER}], 1u);
   if (r >= psParams.grid.w) {
     atomicAdd(&counters[${C_DEFERRED}], 1u);
@@ -287,20 +376,68 @@ fn finalizeRenderList() {
   work[W_INDIRECT + 1u] = rendered;
   work[W_INDIRECT + 2u] = 0u;
   work[W_INDIRECT + 3u] = 0u;
-  // The cull runs one thread per cluster instance. On the common static frame
-  // (no page to render) it is not launched at all, instead of being launched
-  // over the whole scene only for every thread to return.
-  work[W_DISPATCH + 0u] = select(0u, (psParams.misc.y + 63u) / 64u, rendered > 0u);
+  // Pages drawn this frame, for the min/max build; finalizeDynamicList adds its own.
+  work[W_INDIRECT + 12u] = 6u;
+  work[W_INDIRECT + 13u] = rendered;
+  work[W_INDIRECT + 14u] = 0u;
+  work[W_INDIRECT + 15u] = 0u;
+  // The cull runs one thread per static cluster instance. On the common static
+  // frame (no page to render) it is not launched at all, instead of being
+  // launched over the whole scene only for every thread to return.
+  work[W_DISPATCH + 0u] = select(0u, (dynFirst() + 63u) / 64u, rendered > 0u);
   work[W_DISPATCH + 1u] = 1u;
   work[W_DISPATCH + 2u] = 1u;
+}
+
+// K5d (static cache): every requested stale page is composited from the static
+// pool and gets its dynamic casters redrawn, up to dynamicBudget, coarsest
+// level first as in K5. Its entries follow the static list's. A page over
+// budget stays stale (receivers fall back a level) and is taken next frame.
+@compute @workgroup_size(64)
+fn buildDynamicListCoarse(@builtin(global_invocation_id) gid: vec3u) {
+  let perLevel = psParams.grid.y * psParams.grid.y;
+  if (gid.x >= perLevel) { return; }
+  listDynamicPage((psParams.grid.x - 1u) * perLevel + gid.x);
+}
+
+@compute @workgroup_size(64)
+fn buildDynamicListFine(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x >= (psParams.grid.x - 1u) * psParams.grid.y * psParams.grid.y) { return; }
+  listDynamicPage(gid.x);
+}
+
+fn listDynamicPage(idx: u32) {
+  if (idx >= slotCount() || work[W_SLOT_STATE + idx] == 0u) { return; }
+  let e = psPageTable[idx];
+  if ((e.x & (PS_MAPPED | PS_VALID | PS_STALE)) != (PS_MAPPED | PS_STALE)) { return; }
+  let d = atomicAdd(&counters[${C_DYN_PAGES}], 1u);
+  if (d >= dynBudget()) {
+    atomicAdd(&counters[${C_DYN_DEFERRED}], 1u);
+    return;
+  }
+  // After the static list's entries (finalizeRenderList wrote their count).
+  let r = work[W_INDIRECT + 1u] + d;
+  work[W_RENDER_LIST + r] = idx;
+  work[W_SLOT_RENDER + idx] = r;
+  psPageTable[idx].x = (e.x | PS_VALID) & ~PS_STALE;
+}
+
+@compute @workgroup_size(1)
+fn finalizeDynamicList() {
+  work[W_INDIRECT + 13u] = work[W_INDIRECT + 1u] + min(atomicLoad(&counters[${C_DYN_PAGES}]), dynBudget());
 }
 
 // Each level's rect of rendered pages, absolute page coords (min.xy, max.zw);
 // empty (min > max) where the level renders nothing this frame.
 var<workgroup> renderedRects: array<vec4i, PS_MAX_LEVELS>;
+// Static pages this frame (x), and the room the dynamic pairs left in the
+// opaque (y) and alpha (z) lists.
+var<workgroup> cullLimits: vec3u;
 
-// K6: pair every cluster instance with each page being rendered that it overlaps.
-// Dispatched indirectly: not at all on a frame that renders no page.
+// K6: pair every static cluster instance with each static page being rendered
+// that it overlaps. Dispatched indirectly: not at all on a frame that renders
+// no static page. With the static cache, dynamic cluster instances (the last
+// ones) are paired by cullDynamicClusters instead.
 @compute @workgroup_size(64)
 fn cullClusters(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
   let n = i32(psParams.grid.y);
@@ -312,67 +449,110 @@ fn cullClusters(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invoca
     let hi = w + vec2i(i32(atomicLoad(&counters[o + 2u])), i32(atomicLoad(&counters[o + 3u]))) - vec2i(1);
     renderedRects[li] = vec4i(lo, hi);
   }
+  if (li == 0u) {
+    // The dynamic cull ran first (see update), so its pair counts are final.
+    cullLimits = vec3u(work[W_INDIRECT + 1u],
+                       MAX_PAIRS - min(atomicLoad(&counters[${C_DYN_OPAQUE_PAIRS}]), MAX_PAIRS),
+                       MAX_PAIRS - min(atomicLoad(&counters[${C_DYN_ALPHA_PAIRS}]), MAX_PAIRS));
+  }
   workgroupBarrier();
   let i = gid.x;
-  if (i >= psParams.misc.y) { return; }
+  if (i >= dynFirst()) { return; }
   let ci = clusterInstances[i];
   let cl = psCluster(ci.x);
-  let m = psInstance(ci.y);
-  let lc = (cl.aabbMin + cl.aabbMax) * 0.5;
-  let le = (cl.aabbMax - cl.aabbMin) * 0.5;
-  let c = vec3f(dot(m.r0.xyz, lc) + m.r0.w, dot(m.r1.xyz, lc) + m.r1.w, dot(m.r2.xyz, lc) + m.r2.w);
-  // The transformed cluster box is an oriented box with these half axes.
-  // Projecting it straight onto each level's light axes is its exact extent;
-  // going through a world AABB first inflated it twice.
-  let a0 = vec3f(m.r0.x, m.r1.x, m.r2.x) * le.x;
-  let a1 = vec3f(m.r0.y, m.r1.y, m.r2.y) * le.y;
-  let a2 = vec3f(m.r0.z, m.r1.z, m.r2.z) * le.z;
+  let b = clusterBox(cl, psInstance(ci.y));
   let isAlpha = cl.alphaLayer != PS_NONE;
+  let limits = cullLimits;
   for (var level = 0u; level < psParams.grid.x; level++) {
     let live = renderedRects[level];
     if (live.x > live.z) { continue; }
-    let lv = psParams.levels[level];
-    let ax = lv.right.xyz;
-    let ay = lv.up.xyz;
-    // Exact support of the box, plus 1/1000 of a page so f32 rounding (the
-    // vertex stage transforms in another order) can never shave a triangle off
-    // a page it reaches: 1/8 texel at 128 texels a page, while a triangle must
-    // reach half a texel into a page to cover a sample there.
-    let pad = 1e-3 * lv.right.w;
-    let h = vec2f(abs(dot(ax, a0)) + abs(dot(ax, a1)) + abs(dot(ax, a2)),
-                  abs(dot(ay, a0)) + abs(dot(ay, a1)) + abs(dot(ay, a2))) + vec2f(pad);
-    let full = pageRectLs(lv, vec2f(dot(c, ax), dot(c, ay)), h, n);
+    let full = boxPageRect(b, psParams.levels[level], n);
     let rect = vec4i(max(full.xy, live.xy), min(full.zw, live.zw));
     for (var y = rect.y; y <= rect.w; y++) {
       for (var x = rect.x; x <= rect.z; x++) {
         let r = work[W_SLOT_RENDER + psSlotIndex(level, x, y, u32(n))];
-        if (r == PS_NONE) { continue; }
-        var k: u32;
+        // Static casters draw into static pages only (the static list's
+        // entries come first); dynamic-list pages keep their static depth.
+        if (r >= limits.x) { continue; }
+        var fits: bool;
         if (isAlpha) {
-          k = atomicAdd(&counters[${C_ALPHA_PAIRS}], 1u);
-          if (k < MAX_PAIRS) { pairs[MAX_PAIRS + k] = vec2u(i, r); }
+          let k = atomicAdd(&counters[${C_ALPHA_PAIRS}], 1u);
+          fits = k < limits.z;
+          if (fits) { pairs[MAX_PAIRS + k] = vec2u(i, r); }
         } else {
-          k = atomicAdd(&counters[${C_OPAQUE_PAIRS}], 1u);
-          if (k < MAX_PAIRS) { pairs[k] = vec2u(i, r); }
+          let k = atomicAdd(&counters[${C_OPAQUE_PAIRS}], 1u);
+          fits = k < limits.y;
+          if (fits) { pairs[k] = vec2u(i, r); }
         }
         // Pair list full: this page is drawn without this cluster. listPage
         // already marked it valid, so it would keep the hole until its next
         // invalidation. Unmark it: receivers fall back a level this frame and
         // it is rendered again next frame. Every writer stores the same bits,
         // and the raster reads only the phys and tag fields.
-        if (k >= MAX_PAIRS) {
+        if (!fits) {
           let slot = work[W_RENDER_LIST + r];
-          psPageTable[slot].x = psPageTable[slot].x & ~PS_VALID;
+          psPageTable[slot].x = psPageTable[slot].x & ~(PS_VALID | PS_STALE);
         }
       }
     }
   }
 }
 
+// K6d (static cache): pair every dynamic cluster instance with each page drawn
+// this frame that it overlaps, static and dynamic list alike: a static page is
+// composited into the live pool too, so it needs its dynamic casters redrawn.
+// Dispatched over the dynamic cluster instances only, before the static cull;
+// its pairs fill each list from the end, downwards.
+@compute @workgroup_size(64)
+fn cullDynamicClusters(@builtin(global_invocation_id) gid: vec3u) {
+  let i = dynFirst() + gid.x;
+  if (i >= psParams.misc.y || work[W_INDIRECT + 13u] == 0u) { return; }
+  let ci = clusterInstances[i];
+  let m = psInstance(ci.y);
+  // A collapsed (zero-scale) instance casts nothing: its box would be a point
+  // at a meaningless translation.
+  if (all(m.r0.xyz == vec3f(0.0)) && all(m.r1.xyz == vec3f(0.0)) && all(m.r2.xyz == vec3f(0.0))) { return; }
+  let cl = psCluster(ci.x);
+  let b = clusterBox(cl, m);
+  let isAlpha = cl.alphaLayer != PS_NONE;
+  let n = i32(psParams.grid.y);
+  for (var level = 0u; level < psParams.grid.x; level++) {
+    let rect = boxPageRect(b, psParams.levels[level], n);
+    for (var y = rect.y; y <= rect.w; y++) {
+      for (var x = rect.x; x <= rect.z; x++) {
+        let r = work[W_SLOT_RENDER + psSlotIndex(level, x, y, u32(n))];
+        if (r == PS_NONE) { continue; }
+        var k: u32;
+        if (isAlpha) {
+          k = atomicAdd(&counters[${C_DYN_ALPHA_PAIRS}], 1u);
+          if (k < MAX_PAIRS) { pairs[MAX_PAIRS * 2u - 1u - k] = vec2u(i, r); }
+        } else {
+          k = atomicAdd(&counters[${C_DYN_OPAQUE_PAIRS}], 1u);
+          if (k < MAX_PAIRS) { pairs[MAX_PAIRS - 1u - k] = vec2u(i, r); }
+        }
+        // Full: the page's static depth is still good, so it only needs its
+        // dynamic casters again: stale, for next frame's dynamic list. The
+        // static cull runs after this one, and a static overflow on the same
+        // page clears PS_STALE as well (it then needs a full render).
+        if (k >= MAX_PAIRS) {
+          let slot = work[W_RENDER_LIST + r];
+          psPageTable[slot].x = (psPageTable[slot].x & ~PS_VALID) | PS_STALE;
+        }
+      }
+    }
+  }
+}
+
+// Static pairs fill each list from the front and dynamic ones from the end;
+// the static cull stopped where the dynamic pairs begin.
 @compute @workgroup_size(1)
 fn finalizeDraws() {
-  work[W_INDIRECT + 5u] = min(atomicLoad(&counters[${C_OPAQUE_PAIRS}]), MAX_PAIRS);
-  work[W_INDIRECT + 9u] = min(atomicLoad(&counters[${C_ALPHA_PAIRS}]), MAX_PAIRS);
+  let dynOpaque = min(atomicLoad(&counters[${C_DYN_OPAQUE_PAIRS}]), MAX_PAIRS);
+  let dynAlpha = min(atomicLoad(&counters[${C_DYN_ALPHA_PAIRS}]), MAX_PAIRS);
+  work[W_INDIRECT + 5u] = min(atomicLoad(&counters[${C_OPAQUE_PAIRS}]), MAX_PAIRS - dynOpaque);
+  work[W_INDIRECT + 9u] = min(atomicLoad(&counters[${C_ALPHA_PAIRS}]), MAX_PAIRS - dynAlpha);
+  work[W_INDIRECT + 17u] = dynOpaque;
+  work[W_INDIRECT + 21u] = dynAlpha;
 }
 `;
 }
