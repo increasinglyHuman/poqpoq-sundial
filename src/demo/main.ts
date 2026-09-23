@@ -14,6 +14,7 @@ import "@babylonjs/core"; // the demo pulls in every engine extension; the adapt
 import { SundialBabylon } from "../babylon/SundialBabylon";
 import { DepthPrePassAlphaTestFix } from "../babylon/DepthPrePassAlphaTestFix";
 import { buildWorld, SIM } from "./world";
+import { buildCharacters } from "./skinned";
 
 type Mode = "sundial" | "csm" | "off";
 
@@ -104,6 +105,14 @@ async function main() {
     world.materials.push(seaMat);
   }
 
+  // ?skinned=N: N procedural skinned characters walking a loop (skinned casters).
+  // ?skinT=<seconds> freezes their pose at that time, for repeatable shots;
+  // ?skin8=1 spreads their weights over 8 influences (same pose).
+  const skinned = buildCharacters(scene, num("skinned", 0), world.heightAt, q.get("skin8") === "1");
+  if (skinned.characters.length) world.materials.push(skinned.material);
+  const skinT = q.has("skinT") ? num("skinT", 0) : null;
+  for (const c of skinned.characters) c.update(skinT ?? 0);
+
   // Depth prepass experiment. Babylon's needDepthPrePass draws the mesh first
   // with a shader variant that exits right after the alpha test, then the
   // colour pass shades only the surviving front-most texels. On the leaves
@@ -176,6 +185,7 @@ async function main() {
     m.update(startT);
     sundial.addCaster(m.mesh, { dynamic: true });
   }
+  for (const c of skinned.characters) sundial.addCaster(c.mesh, { dynamic: true });
   // ?thinmover=1: a dynamic THIN-INSTANCED caster (four pillars, the third
   // bobbing), the case review F2 found unsupported.
   let thinMover: { mesh: Mesh; group: unknown } | null = null;
@@ -219,7 +229,7 @@ async function main() {
 
   // ---- CSM, configured like ShadowDirector's tiers ------------------------------
   let csm: CascadedShadowGenerator | null = null;
-  const casters: Mesh[] = [world.terrain, world.trunks, world.leaves, ...world.prims, ...world.movers.map((m) => m.mesh)];
+  const casters: Mesh[] = [world.terrain, world.trunks, world.leaves, ...world.prims, ...world.movers.map((m) => m.mesh), ...skinned.characters.map((c) => c.mesh)];
   const makeCsm = () => {
     const high = state.tier === "high";
     const g = new CascadedShadowGenerator(high ? 4096 : 2048, sun);
@@ -291,6 +301,7 @@ async function main() {
     frameMs = frameMs * 0.95 + engine.getDeltaTime() * 0.05;
     if (state.animate) t = Math.min(stopAt, t + dt);
     for (const m of world.movers) m.update(t);
+    for (const c of skinned.characters) c.update(skinT ?? t);
     if (walkSpeed > 0) {
       // Walk back and forth along a 120 m line through the forest.
       walkT += dt * walkSpeed;
