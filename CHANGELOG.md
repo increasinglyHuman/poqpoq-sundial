@@ -19,11 +19,21 @@ may change the API.
   `dynamicPairs`; `contentSummary.dynamicClusterInstances`.
 - Static invalidation regions are capped at 128 per frame with the cache (the
   dynamic regions take the other half); past that, boxes merge as before.
+- **Skinned casters.** `addCaster(mesh, { dynamic: true })` on a mesh with a
+  skeleton casts its current pose, skinned on the GPU in the caster vertex
+  stage: up to 8 influences, 256 bones, both of Babylon's bone matrix
+  storages. The shadow's bounds are derived each frame from per-bone
+  radii, with no CPU skinning. Core: `GeometryInput.skin` and
+  `PagedShadowCore.setSkinPose()`. With the static cache, an animating skinned
+  caster re-composes the pages it crosses like any dynamic caster. Morph
+  targets are not applied.
 
 ### Lab
 
 - `?cache=0`, `?dynBudget=N`, `?movers=N` (walkers through the forest), and
   `?t=` / `?stopAt=` to start and freeze the movers' clock.
+- `?skinned=N` procedural skinned characters (`?skinT` freezes the
+  pose, `?skin8=1` uses 8 influences).
 
 ## 0.1.0 — 2026-09-23
 

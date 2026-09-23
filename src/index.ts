@@ -9,4 +9,5 @@ export type {
   Vec3,
 } from "./core/PagedShadowCore";
 export type { GeometryInput } from "./core/geometry";
+export type { SkinInput } from "./core/skin";
 export { COMMON_WGSL, RECEIVER_WGSL, MAX_LEVELS } from "./core/wgsl";

@@ -20,6 +20,7 @@ import {
   type WorkLayout,
 } from "./kernels";
 import { minMaxWGSL } from "./minmax";
+import { writeSkinRows } from "./skin";
 import { rasterWGSL } from "./raster";
 import { LEVELS_WORD, MAX_LEVELS, MAX_REGIONS, MINMAX_TILE, PARAMS_BYTES, PARAMS_HEADER_BYTES, SHADE_WORD } from "./wgsl";
 
@@ -180,6 +181,11 @@ export interface InstanceGroup {
   readonly first: number; // first instance index
   readonly count: number;
   readonly dynamic: boolean;
+  /**
+   * Instance rows each instance occupies: 1, or for skinned geometry 1 + its
+   * bone count (the bounds row, then one row per bone). Absent means 1.
+   */
+  readonly rowsPerInstance?: number;
 }
 
 interface LevelState {
@@ -629,6 +635,7 @@ export class PagedShadowCore {
 
   /** `matrices` holds 16 floats per instance, column-major with translation at 12..14 (Babylon and three.js layout). */
   addInstances(geometry: number, matrices: Float32Array | number[], dynamic = false): InstanceGroup {
+    if (this.geometries[geometry]?.skin) return this.addSkinnedInstances(geometry, matrices, dynamic);
     const count = matrices.length / 16;
     const first = this.instanceGeometry.length;
     const group: InstanceGroup = { geometry, first, count, dynamic };
@@ -653,6 +660,10 @@ export class PagedShadowCore {
    * this for every instance that moved, every frame: it allocates nothing.
    */
   setInstanceMatrix(group: InstanceGroup, index: number, matrix: Float32Array | number[], offset = 0): void {
+    if (group.rowsPerInstance && group.rowsPerInstance > 1) {
+      this.setSkinPose(group, index, matrix, offset, null, 0);
+      return;
+    }
     const inst = group.first + index;
     const before = this.boxBefore;
     const after = this.boxAfter;
@@ -683,6 +694,73 @@ export class PagedShadowCore {
       } else this.invalidateRange(box[0], box[1], box[2], box[3], box[4], box[5]);
     }
     this.dirtyInstances.add(inst);
+  }
+
+  /**
+   * Skinned geometry: every instance takes 1 + boneCount rows (the bounds row,
+   * then its bones; see skin.ts), initially in the bind pose. Bone rows carry
+   * geometry -1: no cluster instances, no signature, no bounds of their own.
+   */
+  private addSkinnedInstances(geometry: number, matrices: Float32Array | number[], dynamic: boolean): InstanceGroup {
+    const skin = this.geometries[geometry].skin!;
+    const rows = 1 + skin.boneCount;
+    const count = matrices.length / 16;
+    const first = this.instanceGeometry.length;
+    const group: InstanceGroup = { geometry, first, count, dynamic, rowsPerInstance: rows };
+    const need = (first + count * rows) * 12;
+    if (need > this.instanceMatrices.length) {
+      const grown = new Float32Array(Math.max(need, this.instanceMatrices.length * 2));
+      grown.set(this.instanceMatrices.subarray(0, first * 12));
+      this.instanceMatrices = grown;
+    }
+    for (let i = 0; i < count; i++) {
+      writeSkinRows(this.instanceMatrices, (first + i * rows) * 12, skin, matrices, i * 16, null, 0);
+      this.instanceGeometry.push(geometry);
+      for (let b = 1; b < rows; b++) this.instanceGeometry.push(-1);
+    }
+    this.groups.push(group);
+    return group;
+  }
+
+  /**
+   * Pose one instance of a skinned group: its world matrix (16 floats at
+   * `offset`) and its bones' skinning matrices (16 floats each, boneCount of
+   * them from `bonesOffset`, bind-pose mesh space to posed mesh space: what
+   * Babylon's skeleton.getTransformMatrices returns). `bones` null is the bind
+   * pose. The old and new pose boxes are re-rendered next frame, like a move.
+   * Called per frame per animated instance: it allocates nothing.
+   */
+  setSkinPose(
+    group: InstanceGroup,
+    index: number,
+    matrix: Float32Array | number[],
+    offset: number,
+    bones: Float32Array | number[] | null,
+    bonesOffset = 0,
+  ): void {
+    const skin = this.geometries[group.geometry].skin;
+    if (!skin || !group.rowsPerInstance) throw new Error("Sundial: setSkinPose needs a skinned instance group");
+    const inst = group.first + index * group.rowsPerInstance;
+    const before = this.boxBefore;
+    const after = this.boxAfter;
+    const hadBefore = this.instanceBoundsInto(inst, before);
+    writeSkinRows(this.instanceMatrices, inst * 12, skin, matrix, offset, bones, bonesOffset);
+    const hasAfter = this.instanceBoundsInto(inst, after);
+    if (hadBefore && hasAfter) {
+      for (let k = 0; k < 3; k++) {
+        before[k] = Math.min(before[k], after[k]);
+        before[k + 3] = Math.max(before[k + 3], after[k + 3]);
+      }
+    }
+    const box = hadBefore ? before : hasAfter ? after : null;
+    if (box) {
+      // As setInstanceMatrix: with the static cache, a dynamic skinned caster
+      // only re-composes the pages it crossed.
+      if (group.dynamic && this.staticCache) {
+        this.queueRegion(this.dynamicRegions, MAX_REGIONS / 2, box[0], box[1], box[2], box[3], box[4], box[5]);
+      } else this.invalidateRange(box[0], box[1], box[2], box[3], box[4], box[5]);
+    }
+    for (let r = 0; r < group.rowsPerInstance; r++) this.dirtyInstances.add(inst + r);
   }
 
   /** Re-render every cached page whose light-space footprint meets this world box. */
@@ -835,6 +913,11 @@ export class PagedShadowCore {
         indexCount += geo.indices.length;
         clusterCount += geo.clusters.length;
       }
+      // Skin words ride after all indices (see skin.ts): the raster stage has no free storage binding.
+      let skinWords = 0;
+      for (const geo of this.geometries) if (geo.skin) skinWords += geo.skin.words.length;
+      const indexWords = indexCount;
+      indexCount += skinWords;
       const d = this.device;
       const vertexBuffer = d.createBuffer({ label: "ps.vertices", size: Math.max(16, vertexFloats * 4), usage: STORAGE, mappedAtCreation: true });
       const indexBuffer = d.createBuffer({ label: "ps.indices", size: Math.max(16, indexCount * 4), usage: STORAGE, mappedAtCreation: true });
@@ -845,8 +928,16 @@ export class PagedShadowCore {
       const clusterU = new Uint32Array(clusterVec.buffer);
       let vertexBase = 0;
       let indexBase = 0;
+      let skinBase = indexWords;
       let c = 0;
       for (const geo of this.geometries) {
+        // Cluster word 11 (c.w): 0 for rigid geometry, else skin base + 1, bit 31 set for 8 influences.
+        let skinWord = 0;
+        if (geo.skin) {
+          indexView.set(geo.skin.words, skinBase);
+          skinWord = ((skinBase + 1) | (geo.skin.stride === 6 ? 0x80000000 : 0)) >>> 0;
+          skinBase += geo.skin.words.length;
+        }
         vertexView.set(geo.vertices, vertexBase * 5);
         indexView.set(geo.indices, indexBase);
         geomClusterStart.push(c);
@@ -859,6 +950,7 @@ export class PagedShadowCore {
           clusterU[o + 8] = cl.alphaLayer;
           clusterVec[o + 9] = cl.alphaCutoff;
           clusterU[o + 10] = vertexBase;
+          clusterU[o + 11] = skinWord;
           c++;
         }
         vertexBase += geo.vertexCount;
@@ -878,13 +970,20 @@ export class PagedShadowCore {
     // static cache, dynamic groups' come last, so the static and dynamic culls
     // each run over a contiguous range.
     let pairs = 0;
-    for (let inst = 0; inst < this.instanceGeometry.length; inst++) pairs += this.geometries[this.instanceGeometry[inst]].clusters.length;
+    for (let inst = 0; inst < this.instanceGeometry.length; inst++) {
+      const g = this.instanceGeometry[inst];
+      if (g >= 0) pairs += this.geometries[g].clusters.length;
+    }
     const ci = new Uint32Array(pairs * 2);
     let w = 0;
     const emit = (group: InstanceGroup) => {
       const start = geomClusterStart[group.geometry];
       const n = this.geometries[group.geometry].clusters.length;
-      for (let inst = group.first; inst < group.first + group.count; inst++) {
+      // A skinned instance spans 1 + boneCount rows: only its bounds row (the
+      // first) has cluster instances; the bone rows follow it.
+      const rows = group.rowsPerInstance ?? 1;
+      for (let i = 0; i < group.count; i++) {
+        const inst = group.first + i * rows;
         for (let k = 0; k < n; k++) {
           ci[w++] = start + k;
           ci[w++] = inst;
@@ -976,6 +1075,7 @@ export class PagedShadowCore {
     const buckets = new Map<number, number[]>();
     const b = this.boxBefore;
     for (let inst = 0; inst < n; inst++) {
+      if (this.instanceGeometry[inst] < 0) continue; // a skinned instance's bone row: its bounds row speaks for it
       if (!this.instanceBoundsInto(inst, b)) continue; // collapsed: casts nothing, so neither its going nor its coming changes a page
       bounds.set(b, inst * 6);
       let h = keyHash[this.instanceGeometry[inst]];
@@ -1065,7 +1165,7 @@ export class PagedShadowCore {
       geometries: this.geometries.length,
       /** Clusters that cast through an alpha mask. */
       alphaClusters: this.geometries.reduce((s, g) => s + g.clusters.filter((c) => c.alphaLayer !== 0xffffffff).length, 0),
-      instances: this.instanceGeometry.length,
+      instances: this.instanceGeometry.reduce((s, g) => s + (g >= 0 ? 1 : 0), 0),
       clusters: this.clusterCount,
       clusterInstances: this.clusterInstanceCount,
       /** Cluster instances of dynamic groups (0 without the static cache: they are culled with the rest). */

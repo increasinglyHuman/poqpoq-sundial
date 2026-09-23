@@ -2,6 +2,8 @@
 // sorting its triangles along a Morton curve, so each cluster is spatially
 // compact and its bounds cull tightly against individual shadow pages.
 
+import { buildSkin, type BuiltSkin, type SkinInput } from "./skin";
+
 export interface ClusterRecord {
   aabbMin: [number, number, number];
   aabbMax: [number, number, number];
@@ -16,6 +18,8 @@ export interface GeometryInput {
   indices: Uint32Array | Uint16Array | number[];
   uvs?: Float32Array; // xy per vertex; required when alpha is set
   alpha?: { layer: number; cutoff: number };
+  /** Bone influences: the geometry is skinned on the GPU (see skin.ts). */
+  skin?: SkinInput;
 }
 
 export interface BuiltGeometry {
@@ -29,6 +33,12 @@ export interface BuiltGeometry {
   clusters: ClusterRecord[]; // firstIndex relative to this geometry
   aabbMin: [number, number, number];
   aabbMax: [number, number, number];
+  /**
+   * Present on skinned geometry. Its clusters' AABBs and aabbMin/aabbMax are
+   * then the unit box [-1, 1]^3: the instance row maps it onto the pose's
+   * world box every frame (see skin.ts).
+   */
+  skin?: BuiltSkin;
 }
 
 function part1by2(n: number): number {
@@ -157,6 +167,14 @@ export function buildGeometry(input: GeometryInput, clusterTris: number): BuiltG
       vertices[i * 5 + 3] = uvs[i * 2];
       vertices[i * 5 + 4] = uvs[i * 2 + 1];
     }
+  }
+  if (input.skin) {
+    const skin = buildSkin(input.skin, pos, vertexCount);
+    for (const cl of clusters) {
+      cl.aabbMin = [-1, -1, -1];
+      cl.aabbMax = [1, 1, 1];
+    }
+    return { vertices, vertexCount, indices, clusters, aabbMin: [-1, -1, -1], aabbMax: [1, 1, 1], skin };
   }
   return {
     vertices,
