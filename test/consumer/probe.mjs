@@ -49,6 +49,20 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.dynamicFollow.thinA === "A" && res.dynamicFollow.thinB === "B" &&
       // the receiver's min/max early-out changes no pixel, off or back on
       res.minMax?.diffOff === 0 && res.minMax.diffBack === 0 &&
+      // at most one internal (alpha-mask) rebuild before the host's first setCasters: one leaf texture
+      res.rebuild.internalBuilds <= 1 &&
+      // registration memo: unchanged meshes hit it; a mesh edited in place (same array +
+      // updateVerticesData) misses it and casts its new, larger shadow; no memo hit was stale
+      res.memo.sameArray && res.memo.unchangedHits === 5 && res.memo.unchangedMisses === 0 &&
+      res.memo.editedHits === 4 && res.memo.editedMisses === 1 && res.memo.verifyFailures === 0 &&
+      res.memo.lumaGrown < res.memo.lumaGhost - 0.05 &&
+      // updateCasterMatrices moves one member's shadow with one box invalidated and no rebuild; an
+      // internal rebuild keeps it moved; a count change or an unregistered mesh is refused
+      res.moveApi.accepted && res.moveApi.calls.box === 1 && res.moveApi.calls.all === 0 && !res.moveApi.rebuilt &&
+      res.moveApi.lumaMoved > res.moveApi.lumaPosts + 0.05 && res.moveApi.internalBuilds === 1 &&
+      Math.abs(res.moveApi.lumaInternal - res.moveApi.lumaMoved) < 0.02 &&
+      res.moveApi.refusedCount && res.moveApi.refusedUnregistered &&
+      Math.abs(res.moveApi.lumaBack - res.moveApi.lumaPosts) < 0.02 &&
       // requests are per frame: empty sky requests fewer pages than the ground, and they come back
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
       // after dispose, a second instance took over the same materials and is paging
