@@ -193,8 +193,31 @@ interface DynamicCaster {
   groups: InstanceGroup[];
   /** 16 floats per instance: the final world matrices last uploaded. */
   last: Float32Array;
+  /**
+   * This caster's own scratch for the current matrices, one slot per
+   * registered instance. Per caster: one shared buffer was reallocated every
+   * frame whenever two dynamic casters had different instance counts.
+   */
+  now: Float32Array;
+  /** The mesh's world matrix `updateFlag` when last read (see updateDynamics). */
+  worldFlag: number;
+  /** Whether the matrices were last read through the thin-instance buffer. */
+  thin: boolean;
   warnedCount?: boolean;
 }
+
+/** Babylon internals updateDynamics reads to tell, without recomputing, that a world matrix is unchanged. */
+type WorldState = Mesh & { _isDirty: boolean; _worldMatrix: Matrix };
+
+/** The thin-instance buffer Babylon renders from (see casterMatrices), or undefined. */
+function thinMatrixData(mesh: Mesh): Float32Array | null | undefined {
+  return (mesh as unknown as { _thinInstanceDataStorage?: { matrixData?: Float32Array | null } })._thinInstanceDataStorage
+    ?.matrixData;
+}
+
+/** Scratch for the instance x world products: updateDynamics runs every frame and must not allocate. */
+const LOCAL = new Matrix();
+const PRODUCT = new Matrix();
 
 /**
  * The triangles of a mesh that cast, one run per material, following the
@@ -319,27 +342,20 @@ function cameraDepth(camera: Camera, scene: Scene): GPUTexture | null {
   return texture && texture.usage & GPUTextureUsage.TEXTURE_BINDING ? texture : null;
 }
 
-function casterMatrices(mesh: Mesh, out?: Float32Array, instances?: Float32Array): Float32Array {
+function casterMatrices(mesh: Mesh, instances?: Float32Array): Float32Array {
   const world = mesh.computeWorldMatrix(true);
   const count = instances ? instances.length / 16 : mesh.thinInstanceCount;
-  const data =
-    instances ??
-    (mesh as unknown as { _thinInstanceDataStorage?: { matrixData?: Float32Array | null } })._thinInstanceDataStorage
-      ?.matrixData;
+  const data = instances ?? thinMatrixData(mesh);
   if (count > 0 && data) {
-    const result = out && out.length === count * 16 ? out : new Float32Array(count * 16);
-    const local = new Matrix();
-    const tmp = new Matrix();
+    const result = new Float32Array(count * 16);
     for (let i = 0; i < count; i++) {
-      Matrix.FromArrayToRef(data, i * 16, local);
-      local.multiplyToRef(world, tmp);
-      result.set(tmp.m, i * 16);
+      Matrix.FromArrayToRef(data, i * 16, LOCAL);
+      LOCAL.multiplyToRef(world, PRODUCT);
+      result.set(PRODUCT.m, i * 16);
     }
     return result;
   }
-  const result = out && out.length === 16 ? out : new Float32Array(16);
-  result.set(world.m);
-  return result;
+  return new Float32Array(world.m);
 }
 
 export class SundialBabylon {
@@ -365,7 +381,15 @@ export class SundialBabylon {
   private afterCameraObserver: Observer<Camera> | null = null;
   private depthSnapshot: DepthSnapshot | null = null;
   private readonly scratch = new Matrix();
-  private scratchMatrices: Float32Array = new Float32Array(0);
+  /** The fallback path's depth snapshot, reused: captured once a frame, consumed by the next update. */
+  private readonly snapshotStore: DepthSnapshot = { texture: null as unknown as GPUTexture, invViewProj: new Float32Array(16) };
+  /** update()'s input to the core, reused every frame (the core keeps no reference to it). */
+  private readonly frameInput: { eye: Vec3; lightDir: Vec3; pixelWorldSizeAt1m: number; depth?: DepthSnapshot } = {
+    eye: [0, 0, 0],
+    lightDir: [0, 0, 0],
+    pixelWorldSizeAt1m: 0,
+    depth: undefined,
+  };
 
   /**
    * True when Sundial can run on this engine: a WebGPU engine whose device is
@@ -449,7 +473,7 @@ export class SundialBabylon {
     // re-created with the same shape (World does this on load and on edits) keeps
     // its clusters, and identical shapes on different meshes share one geometry.
     const scope = `${positions.length}:${contentHash(positions)}`;
-    let matrices = casterMatrices(mesh, undefined, opts.dynamic ? undefined : opts.instanceMatrices);
+    let matrices = casterMatrices(mesh, opts.dynamic ? undefined : opts.instanceMatrices);
     if (opts.dynamic && opts.capacity && opts.capacity * 16 > matrices.length) {
       // Reserved slots start as zero matrices, which cast nothing.
       const padded = new Float32Array(opts.capacity * 16);
@@ -475,7 +499,17 @@ export class SundialBabylon {
       const geometry = this.core.addGeometry(() => ({ ...compact(run, positions, uvs), alpha }), key);
       groups.push(this.core.addInstances(geometry, matrices, !!opts.dynamic));
     }
-    if (opts.dynamic && groups.length) this.dynamics.push({ mesh, groups, last: matrices.slice() });
+    if (opts.dynamic && groups.length) {
+      this.dynamics.push({
+        mesh,
+        groups,
+        last: matrices.slice(),
+        now: new Float32Array(matrices.length),
+        // casterMatrices just computed it: the flag of exactly the matrix `last` was built from.
+        worldFlag: (mesh as WorldState)._worldMatrix.updateFlag,
+        thin: mesh.thinInstanceCount > 0 && !!thinMatrixData(mesh),
+      });
+    }
     return groups;
   }
 
@@ -612,7 +646,10 @@ export class SundialBabylon {
       this.depthSnapshot = null;
     } else {
       // No mid-frame access: fall back to marking at the next frame's start.
-      this.depthSnapshot = { texture: depth, invViewProj: new Float32Array(this.scratch.m) };
+      const snap = this.snapshotStore;
+      snap.texture = depth;
+      snap.invViewProj.set(this.scratch.m);
+      this.depthSnapshot = snap;
     }
   }
 
@@ -635,13 +672,16 @@ export class SundialBabylon {
     // rendered with. After a resize Babylon has a fresh, empty depth texture:
     // skip marking for that one frame rather than mark garbage.
     const snap = this.depthSnapshot;
-    const depth = snap && snap.texture === current ? { texture: snap.texture, invViewProj: snap.invViewProj } : undefined;
-    this.core.update({
-      eye: [eye.x, eye.y, eye.z],
-      lightDir: [dir.x, dir.y, dir.z],
-      pixelWorldSizeAt1m: (2 * Math.tan(camera.fov / 2)) / engine.getRenderHeight(),
-      depth,
-    });
+    const input = this.frameInput;
+    input.eye[0] = eye.x;
+    input.eye[1] = eye.y;
+    input.eye[2] = eye.z;
+    input.lightDir[0] = dir.x;
+    input.lightDir[1] = dir.y;
+    input.lightDir[2] = dir.z;
+    input.pixelWorldSizeAt1m = (2 * Math.tan(camera.fov / 2)) / engine.getRenderHeight();
+    input.depth = snap && snap.texture === current ? snap : undefined;
+    this.core.update(input);
   }
 
   /**
@@ -655,27 +695,59 @@ export class SundialBabylon {
    */
   private updateDynamics(): void {
     for (const d of this.dynamics) {
-      const now = casterMatrices(d.mesh, this.scratchMatrices);
-      this.scratchMatrices = now;
-      const live = now.length / 16;
+      const mesh = d.mesh as WorldState;
       const slots = d.groups[0].count;
+      const data = thinMatrixData(mesh);
+      const count = mesh.thinInstanceCount;
+      const thin = count > 0 && !!data;
+      // Is the world matrix provably the one read last time? Babylon's own
+      // test (computeWorldMatrix without force returns its cache exactly when
+      // the node is not dirty and isSynchronized(): position, rotation,
+      // scaling, pivot, billboard and every parent unchanged), plus the
+      // matrix's updateFlag, which every write to it changes: a recompute by
+      // Babylon since our last read, or a freezeWorldMatrix(matrix), shows up.
+      // Not computeWorldMatrix(false) itself: at onBeforeRender the render id
+      // is often still the one the last camera evaluated the mesh at, and
+      // Babylon then returns that cache WITHOUT checking isSynchronized, so a
+      // mesh a script moved since would cast a frame late.
+      const cached = mesh._worldMatrix;
+      const worldSame = !mesh._isDirty && mesh.isSynchronized() && cached.updateFlag === d.worldFlag;
+      // A plain mesh (one instance, before and now) whose world matrix did not
+      // change has nothing to upload: skip the recompute and the compare.
+      if (worldSame && !thin && !d.thin) continue;
+      const world = worldSame ? cached : mesh.computeWorldMatrix(true);
+      d.worldFlag = world.updateFlag;
+      d.thin = thin;
+      const live = thin ? count : 1;
       if (live > slots && !d.warnedCount) {
         d.warnedCount = true;
         console.warn(`Sundial: ${d.mesh.name} has ${live} thin instances but ${slots} registered slots; the extra instances do not cast. Pass { capacity } to addCaster.`);
       }
+      // Instances beyond the registered slots do not cast: they are not computed.
+      const now = d.now;
+      if (thin) {
+        for (let i = 0, n = Math.min(live, slots); i < n; i++) {
+          Matrix.FromArrayToRef(data!, i * 16, LOCAL);
+          LOCAL.multiplyToRef(world, PRODUCT);
+          now.set(PRODUCT.m, i * 16);
+        }
+      } else now.set(world.m, 0);
+      const last = d.last;
       for (let i = 0; i < slots; i++) {
         const o = i * 16;
-        const next = i < live ? now.subarray(o, o + 16) : ZERO_MATRIX;
+        // Slots past the live count collapse to a zero matrix, which casts nothing.
+        const src = i < live ? now : ZERO_MATRIX;
+        const so = i < live ? o : 0;
         let moved = false;
         for (let k = 0; k < 16; k++) {
-          if (next[k] !== d.last[o + k]) {
+          if (src[so + k] !== last[o + k]) {
             moved = true;
             break;
           }
         }
         if (moved) {
-          d.last.set(next, o);
-          for (const g of d.groups) this.core.setInstanceMatrix(g, i, next);
+          for (let k = 0; k < 16; k++) last[o + k] = src[so + k];
+          for (const g of d.groups) this.core.setInstanceMatrix(g, i, src, so);
         }
       }
     }

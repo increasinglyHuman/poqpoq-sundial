@@ -93,6 +93,7 @@ export interface Tuning {
 }
 
 export interface Stats {
+  /** The frame the counters below were read back from (every `statsInterval` frames unless profiling). */
   frame: number;
   requestedPages: number;
   residentPages: number;
@@ -110,9 +111,10 @@ export interface Stats {
    */
   droppedPairs: number;
   /**
-   * GPU time in ms (null without timestamp-query) of page marking, page
-   * management and page raster. Marking includes any wait for the previous
-   * frame's depth, so it is an upper bound.
+   * GPU time in ms of page marking, page management and page raster, while
+   * `PagedShadowCore.profiling` is on; null while it is off, and without
+   * timestamp-query. Marking includes any wait for the previous frame's
+   * depth, so it is an upper bound.
    */
   gpuMarkMs: number | null;
   gpuComputeMs: number | null;
@@ -156,6 +158,10 @@ const CACHE_GRACE_BUILDS = 4;
 
 /** Darkness at or above which shadows are invisible: receivers skip the lookup and the core stops working. Mirrored in RECEIVER_WGSL. */
 export const INVISIBLE_DARKNESS = 0.999;
+
+/** Dirty instances at most this many apart are uploaded in one write (the clean rows between re-sent). */
+const UPLOAD_GAP = 16;
+const ascending = (a: number, b: number) => a - b;
 
 /** The depth range covers the scene's bounding sphere times this (plus 16 m), so growing content rarely escapes it. */
 const DEPTH_HEADROOM = 1.25;
@@ -224,6 +230,12 @@ export class PagedShadowCore {
   readonly alphaLayerCount: number;
   private readonly alphaSampler: GPUSampler;
   private readonly params = new ArrayBuffer(PARAMS_BYTES);
+  // Persistent views of `params` and of the mark block: writeParams and
+  // markInto run every frame and must not allocate (a GC pause is a hitch).
+  private readonly paramsF32 = new Float32Array(this.params);
+  private readonly paramsI32 = new Int32Array(this.params);
+  private readonly paramsU32 = new Uint32Array(this.params);
+  private readonly markBlock = new Float32Array(20);
   private readonly levels: LevelState[] = [];
 
   private geometries: BuiltGeometry[] = [];
@@ -269,6 +281,12 @@ export class PagedShadowCore {
   private instanceGeometry: number[] = [];
   private regions: number[] = [];
   private dirtyInstances = new Set<number>();
+  /** Scratch for uploadDirtyInstances: the dirty instances in order, and their rows as f32. */
+  private readonly dirtyOrder: number[] = [];
+  private uploadRows = new Float32Array(0);
+  /** Scratch world boxes (min xyz, max xyz) for setInstanceMatrix. */
+  private readonly boxBefore = new Float64Array(6);
+  private readonly boxAfter = new Float64Array(6);
 
   private sceneBuffer: GPUBuffer | null = null;
   private clusterInstanceBuffer: GPUBuffer | null = null;
@@ -300,9 +318,26 @@ export class PagedShadowCore {
    */
   markRotate = false;
 
+  /**
+   * GPU pass timing. Off by default: with it on, every pass writes timestamps
+   * and every frame resolves them and maps a readback buffer, which is real
+   * per-frame work (a query resolve, a copy, a mapAsync and its promise) that
+   * only a profiler wants. While off, the page counters are still read back,
+   * every `statsInterval` frames, and the GPU ms fields of `stats` are null.
+   * Turn it on to measure (a host's status panel, the benchmark lab); it takes
+   * effect on the next frame.
+   */
+  profiling = false;
+  /** Frames between stats readbacks while not profiling (profiling reads every frame). */
+  statsInterval = 10;
+
   private querySet: GPUQuerySet | null = null;
   private queryResolve: GPUBuffer | null = null;
-  private readbacks: { buffer: GPUBuffer; busy: boolean }[] = [];
+  /** Timestamp writes for the mark, paging and raster passes, built once. */
+  private passTimestamps: GPUComputePassTimestampWrites[] = [];
+  private readbacks: { buffer: GPUBuffer; busy: boolean; timed: boolean }[] = [];
+  /** The pool's depth view, made once: the raster pass renders into it every frame. */
+  private readonly poolView: GPUTextureView;
   private frame = 0;
   private started = false;
 
@@ -344,6 +379,7 @@ export class PagedShadowCore {
       format: "depth32float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
     });
+    this.poolView = this.poolTexture.createView();
     this.alphaSize = options.alphaTextureSize ?? 256;
     const alphaLayers = (this.alphaLayerCount = options.maxAlphaLayers ?? 4);
     this.alphaTexture = device.createTexture({
@@ -371,11 +407,21 @@ export class PagedShadowCore {
     if (this.hasTimestamps) {
       this.querySet = device.createQuerySet({ type: "timestamp", count: 6 });
       this.queryResolve = device.createBuffer({ size: 48, usage: GPUBufferUsage.QUERY_RESOLVE | COPY_SRC });
+      // Mark, paging, raster, and the end of the cull pass: paging spans two
+      // passes (see update), so it starts in one and ends in the other.
+      const q = this.querySet;
+      this.passTimestamps.push(
+        { querySet: q, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 },
+        { querySet: q, beginningOfPassWriteIndex: 2 },
+        { querySet: q, beginningOfPassWriteIndex: 4, endOfPassWriteIndex: 5 },
+        { querySet: q, endOfPassWriteIndex: 3 },
+      );
     }
     for (let i = 0; i < 3; i++) {
       this.readbacks.push({
         buffer: device.createBuffer({ size: COUNTER_COUNT * 4 + 48, usage: GPUBufferUsage.MAP_READ | COPY_DST }),
         busy: false,
+        timed: false,
       });
     }
 
@@ -447,29 +493,46 @@ export class PagedShadowCore {
     return group;
   }
 
-  /** Move one instance. Its old and new footprints are re-rendered next frame. */
-  setInstanceMatrix(group: InstanceGroup, index: number, matrix: Float32Array | number[]): void {
+  /**
+   * Move one instance. Its old and new footprints are re-rendered next frame.
+   * `offset` is where the 16 floats start in `matrix`, so a host tracking many
+   * instances in one array passes it without slicing. Dynamic casters call
+   * this for every instance that moved, every frame: it allocates nothing.
+   */
+  setInstanceMatrix(group: InstanceGroup, index: number, matrix: Float32Array | number[], offset = 0): void {
     const inst = group.first + index;
-    const before = this.instanceBounds(inst);
-    const rows = affineRows(matrix, 0);
-    for (let k = 0; k < 12; k++) this.instanceMatrices[inst * 12 + k] = rows[k];
-    const after = this.instanceBounds(inst);
+    const before = this.boxBefore;
+    const after = this.boxAfter;
+    const hadBefore = this.instanceBoundsInto(inst, before);
+    const m = this.instanceMatrices;
+    const o = inst * 12;
+    // affineRows, in place: 3 rows of a column-major 4x4.
+    m[o] = matrix[offset]; m[o + 1] = matrix[offset + 4]; m[o + 2] = matrix[offset + 8]; m[o + 3] = matrix[offset + 12];
+    m[o + 4] = matrix[offset + 1]; m[o + 5] = matrix[offset + 5]; m[o + 6] = matrix[offset + 9]; m[o + 7] = matrix[offset + 13];
+    m[o + 8] = matrix[offset + 2]; m[o + 9] = matrix[offset + 6]; m[o + 10] = matrix[offset + 10]; m[o + 11] = matrix[offset + 14];
+    const hasAfter = this.instanceBoundsInto(inst, after);
     // A collapsed (zero-scale) instance casts nothing and has no footprint. Its
     // translation is meaningless (usually the origin), so it must not stretch
     // the box: an instance going away or coming back re-renders only where it
     // was or will be, not everything between it and the world origin.
-    const box = before && after
-      ? ([
-          [Math.min(before[0][0], after[0][0]), Math.min(before[0][1], after[0][1]), Math.min(before[0][2], after[0][2])],
-          [Math.max(before[1][0], after[1][0]), Math.max(before[1][1], after[1][1]), Math.max(before[1][2], after[1][2])],
-        ] as [Vec3, Vec3])
-      : (before ?? after);
-    if (box) this.invalidateBox(box[0], box[1]);
+    if (hadBefore && hasAfter) {
+      for (let k = 0; k < 3; k++) {
+        before[k] = Math.min(before[k], after[k]);
+        before[k + 3] = Math.max(before[k + 3], after[k + 3]);
+      }
+    }
+    const box = hadBefore ? before : hasAfter ? after : null;
+    if (box) this.invalidateRange(box[0], box[1], box[2], box[3], box[4], box[5]);
     this.dirtyInstances.add(inst);
   }
 
   /** Re-render every cached page whose light-space footprint meets this world box. */
   invalidateBox(min: Vec3, max: Vec3): void {
+    this.invalidateRange(min[0], min[1], min[2], max[0], max[1], max[2]);
+  }
+
+  /** invalidateBox on six numbers, so per-frame callers need no arrays. */
+  private invalidateRange(x0: number, y0: number, z0: number, x1: number, y1: number, z1: number): void {
     const n = this.regions.length / 8;
     if (n >= MAX_REGIONS) {
       // Full: grow the queued box this one enlarges least, instead of
@@ -483,21 +546,23 @@ export class PagedShadowCore {
         // Sum of extents, not volume: flat boxes (a floor, a wall) have none.
         const before = r[o + 4] - r[o] + (r[o + 5] - r[o + 1]) + (r[o + 6] - r[o + 2]);
         const after =
-          Math.max(r[o + 4], max[0]) - Math.min(r[o], min[0]) +
-          (Math.max(r[o + 5], max[1]) - Math.min(r[o + 1], min[1])) +
-          (Math.max(r[o + 6], max[2]) - Math.min(r[o + 2], min[2]));
+          Math.max(r[o + 4], x1) - Math.min(r[o], x0) +
+          (Math.max(r[o + 5], y1) - Math.min(r[o + 1], y0)) +
+          (Math.max(r[o + 6], z1) - Math.min(r[o + 2], z0));
         if (after - before < bestGrowth) {
           bestGrowth = after - before;
           best = o;
         }
       }
-      for (let k = 0; k < 3; k++) {
-        r[best + k] = Math.min(r[best + k], min[k]);
-        r[best + 4 + k] = Math.max(r[best + 4 + k], max[k]);
-      }
+      r[best] = Math.min(r[best], x0);
+      r[best + 1] = Math.min(r[best + 1], y0);
+      r[best + 2] = Math.min(r[best + 2], z0);
+      r[best + 4] = Math.max(r[best + 4], x1);
+      r[best + 5] = Math.max(r[best + 5], y1);
+      r[best + 6] = Math.max(r[best + 6], z1);
       return;
     }
-    this.regions.push(min[0], min[1], min[2], 0, max[0], max[1], max[2], 0);
+    this.regions.push(x0, y0, z0, 0, x1, y1, z1, 0);
   }
 
   invalidateAll(): void {
@@ -816,13 +881,13 @@ export class PagedShadowCore {
 
     const wg = (n: number) => Math.max(1, Math.ceil(n / 64));
     const k = this.kernels;
-    const timed = (begin: number) =>
-      this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: begin, endOfPassWriteIndex: begin + 1 } : undefined;
+    const profiling = this.profiling && this.passTimestamps.length > 0;
+    const timed = profiling ? this.passTimestamps : null;
     // Marking gets its own pass: it waits on last frame's depth, and that wait
     // must not be billed to page management.
     if (depth && input.depth) {
       const tex = input.depth.texture;
-      const mp = enc.beginComputePass({ label: "ps.mark", timestampWrites: timed(0) });
+      const mp = enc.beginComputePass({ label: "ps.mark", timestampWrites: timed?.[0] });
       mp.setBindGroup(0, this.computeGroup);
       mp.setPipeline(depth.pipeline);
       mp.setBindGroup(1, depth.group);
@@ -832,10 +897,7 @@ export class PagedShadowCore {
     // Paging is two passes around a 12-byte copy: the cull is dispatched
     // indirectly from args finalizeRenderList writes into the work buffer,
     // which cannot be indirect while it is bound writable (see WorkLayout.dispatch).
-    const cp = enc.beginComputePass({
-      label: "ps.paging",
-      timestampWrites: this.querySet ? { querySet: this.querySet, beginningOfPassWriteIndex: 2 } : undefined,
-    });
+    const cp = enc.beginComputePass({ label: "ps.paging", timestampWrites: timed?.[1] });
     cp.setBindGroup(0, this.computeGroup);
     cp.setPipeline(k.updateSlots);
     cp.dispatchWorkgroups(wg(this.slots));
@@ -859,10 +921,7 @@ export class PagedShadowCore {
     cp.dispatchWorkgroups(1);
     cp.end();
     enc.copyBufferToBuffer(this.workBuffer, this.work.dispatch * 4, this.dispatchBuffer, 0, 12);
-    const cull = enc.beginComputePass({
-      label: "ps.cull",
-      timestampWrites: this.querySet ? { querySet: this.querySet, endOfPassWriteIndex: 3 } : undefined,
-    });
+    const cull = enc.beginComputePass({ label: "ps.cull", timestampWrites: timed?.[3] });
     cull.setBindGroup(0, this.computeGroup);
     // Zero workgroups when no page renders this frame (the common static case).
     cull.setPipeline(k.cullClusters);
@@ -878,12 +937,12 @@ export class PagedShadowCore {
       label: "ps.raster",
       colorAttachments: [],
       depthStencilAttachment: {
-        view: this.poolTexture.createView(),
+        view: this.poolView,
         depthLoadOp: this.started ? "load" : "clear",
         depthClearValue: 1,
         depthStoreOp: "store",
       },
-      timestampWrites: timed(4),
+      timestampWrites: timed?.[2],
     });
     rp.setBindGroup(0, this.rasterGroup);
     const indirect = this.work.indirect * 4;
@@ -896,10 +955,20 @@ export class PagedShadowCore {
     rp.end();
     this.started = true;
 
-    const rb = this.readbacks.find((r) => !r.busy);
+    // Counters every statsInterval frames (from the first), or every frame while profiling.
+    let rb: (typeof this.readbacks)[number] | null = null;
+    if (profiling || (this.frame - 1) % Math.max(1, Math.floor(this.statsInterval)) === 0) {
+      for (const r of this.readbacks) {
+        if (!r.busy) {
+          rb = r;
+          break;
+        }
+      }
+    }
     if (rb) {
       enc.copyBufferToBuffer(this.counterBuffer, 0, rb.buffer, 0, COUNTER_COUNT * 4);
-      if (this.querySet && this.queryResolve) {
+      rb.timed = profiling;
+      if (profiling && this.querySet && this.queryResolve) {
         enc.resolveQuerySet(this.querySet, 0, 6, this.queryResolve, 0);
         enc.copyBufferToBuffer(this.queryResolve, 0, rb.buffer, COUNTER_COUNT * 4, 48);
       }
@@ -918,15 +987,19 @@ export class PagedShadowCore {
   markInto(encoder: GPUCommandEncoder, depth: { texture: GPUTexture; invViewProj: ArrayLike<number> }): void {
     if (!this.computeGroup) return;
     const bound = this.bindDepth(depth.texture);
-    const block = new Float32Array(20);
-    block.set(Array.from(depth.invViewProj).slice(0, 16), 0);
-    block.set([depth.texture.width, depth.texture.height, this.markStride, 1], 16);
+    // writeBuffer copies at the call, so one block serves every frame.
+    const block = this.markBlock;
+    const m = depth.invViewProj;
+    const n = Math.min(16, m.length);
+    for (let k = 0; k < 16; k++) block[k] = k < n ? m[k] : 0;
+    block[16] = depth.texture.width;
+    block[17] = depth.texture.height;
+    block[18] = this.markStride;
+    block[19] = 1;
     this.device.queue.writeBuffer(this.paramsBuffer, 20 * 4, block);
     const mp = encoder.beginComputePass({
       label: "ps.mark",
-      timestampWrites: this.querySet
-        ? { querySet: this.querySet, beginningOfPassWriteIndex: 0, endOfPassWriteIndex: 1 }
-        : undefined,
+      timestampWrites: this.profiling && this.passTimestamps.length ? this.passTimestamps[0] : undefined,
     });
     mp.setBindGroup(0, this.computeGroup);
     mp.setPipeline(bound.pipeline);
@@ -983,58 +1056,72 @@ export class PagedShadowCore {
     lv.invalidate = true;
   }
 
+  /**
+   * Fill the params header (and the queued regions) and upload it. Runs every
+   * frame, so it writes through persistent views by index: no typed-array
+   * views, array literals or spreads. The bytes are exactly those the
+   * array-literal version wrote (proved against it frame by frame).
+   */
   private writeParams(input: FrameInput): number {
-    const f = new Float32Array(this.params);
-    const i = new Int32Array(this.params);
-    const u = new Uint32Array(this.params);
+    const f = this.paramsF32;
+    const i = this.paramsI32;
+    const u = this.paramsU32;
     const t = this.tuning;
-    f.set([input.eye[0], input.eye[1], input.eye[2], input.pixelWorldSizeAt1m], 0);
-    f.set([t.lodBias, t.normalOffset, t.depthBias, t.debugMode], 4);
-    u.set([this.poolSize, this.poolSize / this.pageSize, this.pageSize, this.pageCount], 8);
-    u.set([this.levelCount, this.pagesPerSide, this.frame, Math.min(t.renderBudget, this.renderBudgetMax)], 12);
+    const eye = input.eye;
+    f[0] = eye[0]; f[1] = eye[1]; f[2] = eye[2]; f[3] = input.pixelWorldSizeAt1m;
+    f[4] = t.lodBias; f[5] = t.normalOffset; f[6] = t.depthBias; f[7] = t.debugMode;
+    u[8] = this.poolSize; u[9] = this.poolSize / this.pageSize; u[10] = this.pageSize; u[11] = this.pageCount;
+    u[12] = this.levelCount; u[13] = this.pagesPerSide; u[14] = this.frame; u[15] = Math.min(t.renderBudget, this.renderBudgetMax);
     const regionCount = Math.min(MAX_REGIONS, this.regions.length / 8);
-    u.set([regionCount, this.clusterInstanceCount, this.maxPairs, this.clusterCount], 16);
+    u[16] = regionCount; u[17] = this.clusterInstanceCount; u[18] = this.maxPairs; u[19] = this.clusterCount;
     if (input.depth) {
-      f.set(Array.from(input.depth.invViewProj).slice(0, 16), 20);
-      f.set([input.depth.texture.width, input.depth.texture.height, this.markStride, 1], 36);
+      const m = input.depth.invViewProj;
+      // At most 16: words 36.. are the depth size and stride.
+      const n = Math.min(16, m.length);
+      for (let k = 0; k < n; k++) f[20 + k] = m[k];
+      f[36] = input.depth.texture.width; f[37] = input.depth.texture.height; f[38] = this.markStride; f[39] = 1;
     } else {
-      f.set([0, 0, this.markStride, 0], 36);
+      f[36] = 0; f[37] = 0; f[38] = this.markStride; f[39] = 0;
     }
-    f.set([Math.min(1, Math.max(0, t.darkness)), this.markRotate && this.markStride > 1 ? 1 : 0, 0, 0], SHADE_WORD);
+    f[SHADE_WORD] = Math.min(1, Math.max(0, t.darkness)); f[SHADE_WORD + 1] = this.markRotate && this.markStride > 1 ? 1 : 0;
+    f[SHADE_WORD + 2] = 0; f[SHADE_WORD + 3] = 0;
 
-    const corners: Vec3[] = [];
-    for (let k = 0; k < 8; k++) {
-      corners.push([
-        k & 1 ? this.sceneMax[0] : this.sceneMin[0],
-        k & 2 ? this.sceneMax[1] : this.sceneMin[1],
-        k & 4 ? this.sceneMax[2] : this.sceneMin[2],
-      ]);
-    }
+    const lo = this.sceneMin;
+    const hi = this.sceneMax;
     const half = this.pagesPerSide / 2;
     for (let l = 0; l < this.levelCount; l++) {
       const lv = this.levels[l];
       const pageWorld = this.finestPageWorldSize * 2 ** l;
       const base = LEVELS_WORD + l * 28;
-      f.set([...lv.right, pageWorld], base);
-      f.set([...lv.up, 1 / pageWorld], base + 4);
-      f.set([...lv.dir, pageWorld / this.pageSize], base + 8);
-      f.set([lv.zMin, 1 / lv.zRange, lv.zRange, 0], base + 12);
-      const cx = Math.floor(dot(input.eye, lv.right) / pageWorld);
-      const cy = Math.floor(dot(input.eye, lv.up) / pageWorld);
-      i.set([cx - half, cy - half, 0, 0], base + 16);
+      const r = lv.right;
+      const up = lv.up;
+      const dir = lv.dir;
+      f[base] = r[0]; f[base + 1] = r[1]; f[base + 2] = r[2]; f[base + 3] = pageWorld;
+      f[base + 4] = up[0]; f[base + 5] = up[1]; f[base + 6] = up[2]; f[base + 7] = 1 / pageWorld;
+      f[base + 8] = dir[0]; f[base + 9] = dir[1]; f[base + 10] = dir[2]; f[base + 11] = pageWorld / this.pageSize;
+      f[base + 12] = lv.zMin; f[base + 13] = 1 / lv.zRange; f[base + 14] = lv.zRange; f[base + 15] = 0;
+      const cx = Math.floor(dot(eye, r) / pageWorld);
+      const cy = Math.floor(dot(eye, up) / pageWorld);
+      i[base + 16] = cx - half; i[base + 17] = cy - half; i[base + 18] = 0; i[base + 19] = 0;
+      // The scene box's page rect: its 8 corners projected on the level's basis.
       let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (const c of corners) {
-        const x = Math.floor(dot(c, lv.right) / pageWorld);
-        const y = Math.floor(dot(c, lv.up) / pageWorld);
+      for (let k = 0; k < 8; k++) {
+        const c0 = k & 1 ? hi[0] : lo[0];
+        const c1 = k & 2 ? hi[1] : lo[1];
+        const c2 = k & 4 ? hi[2] : lo[2];
+        const x = Math.floor((c0 * r[0] + c1 * r[1] + c2 * r[2]) / pageWorld);
+        const y = Math.floor((c0 * up[0] + c1 * up[1] + c2 * up[2]) / pageWorld);
         x0 = Math.min(x0, x); y0 = Math.min(y0, y);
         x1 = Math.max(x1, x); y1 = Math.max(y1, y);
       }
-      i.set([x0, y0, x1, y1], base + 20);
-      u.set([lv.invalidate ? 1 : 0, 0, 0, 0], base + 24);
+      i[base + 20] = x0; i[base + 21] = y0; i[base + 22] = x1; i[base + 23] = y1;
+      u[base + 24] = lv.invalidate ? 1 : 0; u[base + 25] = 0; u[base + 26] = 0; u[base + 27] = 0;
       lv.invalidate = false;
     }
-    f.set(this.regions.slice(0, regionCount * 8), PARAMS_HEADER_BYTES / 4);
-    this.regions.length = 0;
+    const regions = this.regions;
+    const r0 = PARAMS_HEADER_BYTES / 4;
+    for (let k = 0, n = regionCount * 8; k < n; k++) f[r0 + k] = regions[k];
+    regions.length = 0;
     this.device.queue.writeBuffer(this.paramsBuffer, 0, this.params, 0, PARAMS_HEADER_BYTES + regionCount * 32);
     return regionCount;
   }
@@ -1066,42 +1153,81 @@ export class PagedShadowCore {
     return { pipeline, group: this.depthBinding.group };
   }
 
+  /**
+   * Upload the rows of every instance moved since the last frame. Dirty
+   * instances are sorted and written as runs: instances at most UPLOAD_GAP
+   * apart share one writeBuffer (the clean rows between them are re-sent as
+   * they are, which is cheaper than another call), so a linkset or a crowd
+   * moving together costs one or a few writes instead of one per instance.
+   */
   private uploadDirtyInstances(): void {
     if (!this.sceneBuffer || this.dirtyInstances.size === 0) return;
-    const base = this.clusterCount * 48;
-    for (const inst of this.dirtyInstances) {
-      const rows = new Float32Array(this.instanceMatrices.slice(inst * 12, inst * 12 + 12));
-      this.device.queue.writeBuffer(this.sceneBuffer, base + inst * 48, rows);
-    }
+    const order = this.dirtyOrder;
+    order.length = 0;
+    for (const inst of this.dirtyInstances) order.push(inst);
     this.dirtyInstances.clear();
+    order.sort(ascending);
+    // Staging floats needed: every run's span.
+    let floats = 0;
+    for (let a = 0; a < order.length; ) {
+      let b = a;
+      while (b + 1 < order.length && order[b + 1] - order[b] <= UPLOAD_GAP) b++;
+      floats += (order[b] - order[a] + 1) * 12;
+      a = b + 1;
+    }
+    if (this.uploadRows.length < floats) this.uploadRows = new Float32Array(Math.max(floats, this.uploadRows.length * 2));
+    const rows = this.uploadRows;
+    const m = this.instanceMatrices;
+    const base = this.clusterCount * 48;
+    let w = 0;
+    for (let a = 0; a < order.length; ) {
+      let b = a;
+      while (b + 1 < order.length && order[b + 1] - order[b] <= UPLOAD_GAP) b++;
+      const first = order[a];
+      const count = (order[b] - first + 1) * 12;
+      for (let k = 0; k < count; k++) rows[w + k] = m[first * 12 + k];
+      // writeBuffer copies at the call, so the staging array is reused at once.
+      this.device.queue.writeBuffer(this.sceneBuffer, base + first * 48, rows, w, count);
+      w += count;
+      a = b + 1;
+    }
   }
 
   /** An instance's world AABB, or null when it is collapsed to zero scale (it casts nothing). */
   private instanceBounds(inst: number): [Vec3, Vec3] | null {
-    const g = this.geometries[this.instanceGeometry[inst]];
-    const m = this.instanceMatrices.slice(inst * 12, inst * 12 + 12);
-    let linear = 0;
-    for (let r = 0; r < 3; r++) linear += Math.abs(m[r * 4]) + Math.abs(m[r * 4 + 1]) + Math.abs(m[r * 4 + 2]);
-    if (linear === 0) return null;
-    const c: Vec3 = [0, 0, 0];
-    const e: Vec3 = [0, 0, 0];
-    for (let k = 0; k < 3; k++) {
-      c[k] = (g.aabbMin[k] + g.aabbMax[k]) / 2;
-      e[k] = (g.aabbMax[k] - g.aabbMin[k]) / 2;
-    }
-    const wc: Vec3 = [0, 0, 0];
-    const we: Vec3 = [0, 0, 0];
-    for (let r = 0; r < 3; r++) {
-      wc[r] = m[r * 4] * c[0] + m[r * 4 + 1] * c[1] + m[r * 4 + 2] * c[2] + m[r * 4 + 3];
-      we[r] = Math.abs(m[r * 4]) * e[0] + Math.abs(m[r * 4 + 1]) * e[1] + Math.abs(m[r * 4 + 2]) * e[2];
-    }
+    const b = new Float64Array(6);
+    if (!this.instanceBoundsInto(inst, b)) return null;
     return [
-      [wc[0] - we[0], wc[1] - we[1], wc[2] - we[2]],
-      [wc[0] + we[0], wc[1] + we[1], wc[2] + we[2]],
+      [b[0], b[1], b[2]],
+      [b[3], b[4], b[5]],
     ];
   }
 
-  private readStats(rb: { buffer: GPUBuffer; busy: boolean }, frame: number): void {
+  /** instanceBounds into `out` (min xyz, max xyz); false when the instance is collapsed. */
+  private instanceBoundsInto(inst: number, out: Float64Array): boolean {
+    const g = this.geometries[this.instanceGeometry[inst]];
+    const m = this.instanceMatrices;
+    const o = inst * 12;
+    let linear = 0;
+    for (let r = 0; r < 3; r++) linear += Math.abs(m[o + r * 4]) + Math.abs(m[o + r * 4 + 1]) + Math.abs(m[o + r * 4 + 2]);
+    if (linear === 0) return false;
+    const c0 = (g.aabbMin[0] + g.aabbMax[0]) / 2;
+    const c1 = (g.aabbMin[1] + g.aabbMax[1]) / 2;
+    const c2 = (g.aabbMin[2] + g.aabbMax[2]) / 2;
+    const e0 = (g.aabbMax[0] - g.aabbMin[0]) / 2;
+    const e1 = (g.aabbMax[1] - g.aabbMin[1]) / 2;
+    const e2 = (g.aabbMax[2] - g.aabbMin[2]) / 2;
+    for (let r = 0; r < 3; r++) {
+      const p = o + r * 4;
+      const wc = m[p] * c0 + m[p + 1] * c1 + m[p + 2] * c2 + m[p + 3];
+      const we = Math.abs(m[p]) * e0 + Math.abs(m[p + 1]) * e1 + Math.abs(m[p + 2]) * e2;
+      out[r] = wc - we;
+      out[r + 3] = wc + we;
+    }
+    return true;
+  }
+
+  private readStats(rb: { buffer: GPUBuffer; busy: boolean; timed: boolean }, frame: number): void {
     rb.busy = true;
     rb.buffer
       .mapAsync(GPUMapMode.READ)
@@ -1119,12 +1245,15 @@ export class PagedShadowCore {
         s.opaquePairs = c[C_OPAQUE_PAIRS];
         s.alphaPairs = c[C_ALPHA_PAIRS];
         s.droppedPairs = Math.max(0, c[C_OPAQUE_PAIRS] - this.maxPairs) + Math.max(0, c[C_ALPHA_PAIRS] - this.maxPairs);
-        if (this.querySet) {
+        if (rb.timed && this.querySet) {
           const ts = new BigUint64Array(data, COUNTER_COUNT * 4, 6);
           const ms = (a: bigint, b: bigint) => (b > a ? Number(b - a) / 1e6 : 0);
           s.gpuMarkMs = ms(ts[0], ts[1]);
           s.gpuComputeMs = ms(ts[2], ts[3]);
           s.gpuRasterMs = ms(ts[4], ts[5]);
+        } else if (!this.profiling) {
+          // Not profiling: no timings, rather than stale ones that look live.
+          s.gpuMarkMs = s.gpuComputeMs = s.gpuRasterMs = null;
         }
         rb.buffer.unmap();
         rb.busy = false;

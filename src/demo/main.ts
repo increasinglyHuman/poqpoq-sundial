@@ -126,6 +126,9 @@ async function main() {
     renderBudget: num("budget", 96),
     clipDistances: q.get("clip") !== "0",
   });
+  // The lab reports GPU pass times, so it profiles by default (the library does
+  // not). ?profile=0 measures what running without timestamps saves.
+  sundial.core.profiling = q.get("profile") !== "0";
   sundial.setAlphaMask(0, world.leafMask, 0.5);
   sundial.addCaster(world.terrain);
   sundial.addCaster(world.trunks);
