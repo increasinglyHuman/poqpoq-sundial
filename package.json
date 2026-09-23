@@ -50,7 +50,7 @@
     "test:consumer": "npm run build && cd test/consumer && npm install --no-audit --no-fund && node probe.mjs"
   },
   "peerDependencies": {
-    "@babylonjs/core": ">=9.17.1"
+    "@babylonjs/core": "^9.17.1"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.60",
