@@ -297,13 +297,26 @@ export class PagedShadowCore {
    * instance's signature (geometry key + matrix) with its world bounds. The next
    * build() re-renders only the pages under instances that appeared or went.
    */
-  private previousInstances: Map<string, [Vec3, Vec3][]> | null = null;
-  /** What the last build() did, for hosts to report. */
-  lastBuild = { reusedGeometry: false, invalidated: "all" as "all" | number };
+  private previousInstances: InstanceSnapshot | null = null;
+  /**
+   * What the last build() did, for hosts to report. `internal`: the build was
+   * the adapter's own (an alpha mask arriving, addCaster after start), not a
+   * host call, so a host's rebuild log would not show it.
+   */
+  lastBuild = { reusedGeometry: false, invalidated: "all" as "all" | number, internal: false };
+  /** Builds so far, and how many of them were internal (see lastBuild.internal). */
+  private builds = 0;
+  private internalBuilds = 0;
   /** True while shadows are fully faded and update() is skipping all GPU work. */
   dormant = false;
   private groups: InstanceGroup[] = [];
-  private instanceMatrices: number[] = []; // 12 floats (3 affine rows) per instance
+  /**
+   * 12 floats (3 affine rows) per instance, for instanceGeometry.length
+   * instances; grown by doubling. A typed array, not number[] grown with
+   * push(...rows): that spread allocated an array per instance, and the scene
+   * upload copies these floats as they are.
+   */
+  private instanceMatrices = new Float32Array(12 * 256);
   private instanceGeometry: number[] = [];
   private regions: number[] = [];
   private dirtyInstances = new Set<number>();
@@ -475,6 +488,16 @@ export class PagedShadowCore {
    * it is then called only when the key is not cached, so a host can skip
    * preparing geometry that will not be used.
    */
+  /**
+   * Whether geometry registered under `key` would reuse clusters (registered
+   * since clearContent(), or still cached) instead of calling its input. A
+   * host that skips preparing an input for a known key must check this: a key
+   * unused for CACHE_GRACE_BUILDS builds is evicted.
+   */
+  hasGeometry(key: string): boolean {
+    return this.geometryKeys.has(key) || this.geometryCache.has(key);
+  }
+
   addGeometry(input: GeometryInput | (() => GeometryInput), key?: string): number {
     const resolve = () => (typeof input === "function" ? input() : input);
     if (key !== undefined) {
@@ -510,7 +533,8 @@ export class PagedShadowCore {
     this.geometryKeys.clear();
     this.cacheHits = 0;
     this.groups = [];
-    this.instanceMatrices = [];
+    // Fresh arrays, not cleared ones: the snapshot above still reads the old ones.
+    this.instanceMatrices = new Float32Array(this.instanceMatrices.length);
     this.instanceGeometry = [];
     this.dirtyInstances.clear();
   }
@@ -518,9 +542,16 @@ export class PagedShadowCore {
   /** `matrices` holds 16 floats per instance, column-major with translation at 12..14 (Babylon and three.js layout). */
   addInstances(geometry: number, matrices: Float32Array | number[], dynamic = false): InstanceGroup {
     const count = matrices.length / 16;
-    const group: InstanceGroup = { geometry, first: this.instanceGeometry.length, count, dynamic };
+    const first = this.instanceGeometry.length;
+    const group: InstanceGroup = { geometry, first, count, dynamic };
+    const need = (first + count) * 12;
+    if (need > this.instanceMatrices.length) {
+      const grown = new Float32Array(Math.max(need, this.instanceMatrices.length * 2));
+      grown.set(this.instanceMatrices.subarray(0, first * 12));
+      this.instanceMatrices = grown;
+    }
     for (let i = 0; i < count; i++) {
-      this.instanceMatrices.push(...affineRows(matrices, i * 16));
+      writeAffineRows(this.instanceMatrices, (first + i) * 12, matrices, i * 16);
       this.instanceGeometry.push(geometry);
     }
     this.groups.push(group);
@@ -680,7 +711,10 @@ export class PagedShadowCore {
    * and re-renders only the pages under instances that appeared, went or moved
    * (every page when that cannot be told, or when too much changed).
    */
-  build(): void {
+  build(options: { internal?: boolean } = {}): void {
+    const internal = !!options.internal;
+    this.builds++;
+    if (internal) this.internalBuilds++;
     const keys = this.geometryKeyOrder.includes(null) ? null : this.geometryKeyOrder.join("\n");
     const reuse = keys !== null && this.packed?.keys === keys;
     this.destroyContentBuffers(reuse);
@@ -757,14 +791,15 @@ export class PagedShadowCore {
     }
     this.clusterInstanceCount = pairs;
 
-    const scene = new Float32Array(clusterVec.length + this.instanceMatrices.length);
+    const instanceFloats = this.instanceGeometry.length * 12;
+    const scene = new Float32Array(clusterVec.length + instanceFloats);
     scene.set(clusterVec, 0);
-    scene.set(this.instanceMatrices, clusterVec.length);
+    scene.set(this.instanceMatrices.subarray(0, instanceFloats), clusterVec.length);
 
     this.sceneBuffer = this.upload("ps.scene", scene, STORAGE | COPY_DST);
     this.clusterInstanceBuffer = this.upload("ps.clusterInstances", ci, STORAGE);
     this.dirtyInstances.clear();
-    this.lastBuild = { reusedGeometry: reuse, invalidated: this.started ? this.invalidateChanged() : 0 };
+    this.lastBuild = { reusedGeometry: reuse, invalidated: this.started ? this.invalidateChanged() : 0, internal };
 
     const d = this.device;
     this.computeGroup = d.createBindGroup({
@@ -813,20 +848,36 @@ export class PagedShadowCore {
     this.computeGroup = this.rasterGroup = null;
   }
 
-  /** Every live instance's signature (geometry key + matrix) with its world bounds. */
-  private instanceSignatures(): Map<string, [Vec3, Vec3][]> {
-    const out = new Map<string, [Vec3, Vec3][]>();
+  /**
+   * Every live instance's signature (geometry key + matrix) with its world
+   * bounds, bucketed by a numeric hash of that signature. Equality is then
+   * confirmed exactly (sameSignature), so a hash collision costs a compare,
+   * never a wrong diff. This used to build a 12-number string per instance,
+   * twice per rebuild (~2 us each: ~16 ms over a comm sim's 3,943 instances).
+   */
+  private instanceSignatures(): InstanceSnapshot {
+    const n = this.instanceGeometry.length;
     const m = this.instanceMatrices;
-    for (let inst = 0; inst < this.instanceGeometry.length; inst++) {
-      const bounds = this.instanceBounds(inst);
-      if (!bounds) continue; // collapsed: casts nothing, so neither its going nor its coming changes a page
+    // One string hash per geometry, not per instance.
+    const keyHash = this.geometryKeyOrder.map((k) => (k === null ? 0 : hashString(k)));
+    const bounds = new Float64Array(n * 6);
+    const buckets = new Map<number, number[]>();
+    const b = this.boxBefore;
+    for (let inst = 0; inst < n; inst++) {
+      if (!this.instanceBoundsInto(inst, b)) continue; // collapsed: casts nothing, so neither its going nor its coming changes a page
+      bounds.set(b, inst * 6);
+      let h = keyHash[this.instanceGeometry[inst]];
       const o = inst * 12;
-      const sig = `${this.geometryKeyOrder[this.instanceGeometry[inst]]}|${m[o]},${m[o + 1]},${m[o + 2]},${m[o + 3]},${m[o + 4]},${m[o + 5]},${m[o + 6]},${m[o + 7]},${m[o + 8]},${m[o + 9]},${m[o + 10]},${m[o + 11]}`;
-      let list = out.get(sig);
-      if (!list) out.set(sig, (list = []));
-      list.push(bounds);
+      for (let k = 0; k < 12; k++) {
+        // +0 folds -0 into 0: they compare equal (sameSignature uses ===), so must hash alike.
+        F32[0] = m[o + k] + 0;
+        h = Math.imul(h ^ U32[0], 0x01000193) ^ (h >>> 13);
+      }
+      const list = buckets.get(h);
+      if (list) list.push(inst);
+      else buckets.set(h, [inst]);
     }
-    return out;
+    return { matrices: m, geometry: this.instanceGeometry, keys: this.geometryKeyOrder, bounds, buckets };
   }
 
   /**
@@ -845,14 +896,41 @@ export class PagedShadowCore {
     }
     const after = this.instanceSignatures();
     const boxes: [Vec3, Vec3][] = [];
-    for (const [sig, olds] of before) {
-      const kept = after.get(sig)?.length ?? 0;
-      for (let i = kept; i < olds.length; i++) boxes.push(olds[i]);
+    const box = (snap: InstanceSnapshot, inst: number): [Vec3, Vec3] => {
+      const o = inst * 6;
+      const b = snap.bounds;
+      return [[b[o], b[o + 1], b[o + 2]], [b[o + 3], b[o + 4], b[o + 5]]];
+    };
+    // A multiset difference per hash bucket: each old instance consumes one
+    // equal new one, and whatever is left on either side went or came. `from`
+    // skips the consumed new instances at the front, so a bucket of many
+    // identical instances matches in linear time.
+    for (const [h, olds] of before.buckets) {
+      const news = after.buckets.get(h);
+      if (!news) {
+        for (const i of olds) boxes.push(box(before, i));
+        continue;
+      }
+      const used = new Uint8Array(news.length);
+      let from = 0;
+      for (const i of olds) {
+        let hit = -1;
+        for (let j = from; j < news.length; j++) {
+          if (!used[j] && sameSignature(before, i, after, news[j])) {
+            hit = j;
+            break;
+          }
+        }
+        if (hit < 0) boxes.push(box(before, i));
+        else {
+          used[hit] = 1;
+          while (from < news.length && used[from]) from++;
+        }
+      }
+      for (let j = 0; j < news.length; j++) if (!used[j]) boxes.push(box(after, news[j]));
+      after.buckets.delete(h);
     }
-    for (const [sig, news] of after) {
-      const had = before.get(sig)?.length ?? 0;
-      for (let i = had; i < news.length; i++) boxes.push(news[i]);
-    }
+    for (const news of after.buckets.values()) for (const j of news) boxes.push(box(after, j));
     // Past the region budget boxes merge (invalidateBox); only a change far
     // too large to be worth diffing re-renders everything.
     if (boxes.length > MAX_REGIONS * 8) {
@@ -869,6 +947,9 @@ export class PagedShadowCore {
       cachedGeometries: this.cacheHits,
       /** The last build kept the packed geometry, and how much it re-rendered ("all" or boxes). */
       lastBuild: { ...this.lastBuild },
+      /** build() calls so far, and how many were the adapter's own (not a host call; see lastBuild.internal). */
+      builds: this.builds,
+      internalBuilds: this.internalBuilds,
       geometries: this.geometries.length,
       /** Clusters that cast through an alpha mask. */
       alphaClusters: this.geometries.reduce((s, g) => s + g.clusters.filter((c) => c.alphaLayer !== 0xffffffff).length, 0),
@@ -1245,17 +1326,7 @@ export class PagedShadowCore {
     }
   }
 
-  /** An instance's world AABB, or null when it is collapsed to zero scale (it casts nothing). */
-  private instanceBounds(inst: number): [Vec3, Vec3] | null {
-    const b = new Float64Array(6);
-    if (!this.instanceBoundsInto(inst, b)) return null;
-    return [
-      [b[0], b[1], b[2]],
-      [b[3], b[4], b[5]],
-    ];
-  }
-
-  /** instanceBounds into `out` (min xyz, max xyz); false when the instance is collapsed. */
+  /** An instance's world AABB into `out` (min xyz, max xyz); false when it is collapsed to zero scale (it casts nothing). */
   private instanceBoundsInto(inst: number, out: Float64Array): boolean {
     const g = this.geometries[this.instanceGeometry[inst]];
     const m = this.instanceMatrices;
@@ -1421,10 +1492,43 @@ export class PagedShadowCore {
   }
 }
 
-function affineRows(m: Float32Array | number[], o: number): number[] {
-  return [
-    m[o], m[o + 4], m[o + 8], m[o + 12],
-    m[o + 1], m[o + 5], m[o + 9], m[o + 13],
-    m[o + 2], m[o + 6], m[o + 10], m[o + 14],
-  ];
+/** The 3 affine rows of the column-major 4x4 at m[o..], written to dst[d..d+12]. */
+function writeAffineRows(dst: Float32Array, d: number, m: Float32Array | number[], o: number): void {
+  dst[d] = m[o]; dst[d + 1] = m[o + 4]; dst[d + 2] = m[o + 8]; dst[d + 3] = m[o + 12];
+  dst[d + 4] = m[o + 1]; dst[d + 5] = m[o + 5]; dst[d + 6] = m[o + 9]; dst[d + 7] = m[o + 13];
+  dst[d + 8] = m[o + 2]; dst[d + 9] = m[o + 6]; dst[d + 10] = m[o + 10]; dst[d + 11] = m[o + 14];
+}
+
+/**
+ * The live instances at clearContent(), for build() to diff against: their
+ * matrices and geometry keys (the arrays themselves: clearContent() replaces
+ * them rather than clearing them), world bounds (6 per instance), and the
+ * non-collapsed instances bucketed by signature hash.
+ */
+interface InstanceSnapshot {
+  matrices: Float32Array;
+  geometry: number[];
+  keys: (string | null)[];
+  bounds: Float64Array;
+  buckets: Map<number, number[]>;
+}
+
+const F32 = new Float32Array(1);
+const U32 = new Uint32Array(F32.buffer);
+
+function hashString(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193);
+  return h;
+}
+
+/** Same geometry key and exactly the same matrix (=== per float, as the string signature compared). */
+function sameSignature(a: InstanceSnapshot, i: number, b: InstanceSnapshot, j: number): boolean {
+  if (a.keys[a.geometry[i]] !== b.keys[b.geometry[j]]) return false;
+  const ma = a.matrices;
+  const mb = b.matrices;
+  const oa = i * 12;
+  const ob = j * 12;
+  for (let k = 0; k < 12; k++) if (ma[oa + k] !== mb[ob + k]) return false;
+  return true;
 }

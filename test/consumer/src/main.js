@@ -159,6 +159,79 @@ try {
         r.rebuildAdd = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
         sd.setCasters(base); extra.dispose(); await frames(20);
         r.rebuildRemove = { ...sd.core.contentSummary.lastBuild, luma: await meanLuma() };
+
+        // Registration memo. Unchanged meshes skip reading and hashing their geometry; a mesh whose
+        // vertices are edited IN PLACE (same array, then updateVerticesData, as World's Dozer does)
+        // must be re-read and cast its new shape. The ghost is hidden from the camera (layerMask), so
+        // only its shadow shows in the frame. verifyRegistrationMemo re-reads every memo hit and counts
+        // any that registered stale content.
+        sd.verifyRegistrationMemo = true;
+        const stats = () => ({ ...sd.registrationStats });
+        const ghost = MeshBuilder.CreatePlane("ghost", { size: 2, updatable: true }, scene);
+        ghost.rotation.x = Math.PI / 2; ghost.position.set(6, 4, -8); ghost.layerMask = 0x10000000;
+        sd.setCasters([...base, ghost]); await frames(20);
+        const lumaGhost = await meanLuma();
+        const s0 = stats();
+        sd.setCasters([...base, ghost]); await frames(5);
+        const s1 = stats();
+        const positions = ghost.getVerticesData("position");
+        const sameArray = positions === ghost.getVertexBuffer("position").getData();
+        for (let i = 0; i < positions.length; i++) positions[i] *= 2; // 2 m -> 4 m, in place
+        ghost.updateVerticesData("position", positions);
+        sd.setCasters([...base, ghost]); await frames(20);
+        const s2 = stats();
+        r.memo = {
+          sameArray,
+          unchangedHits: s1.memoHits - s0.memoHits, unchangedMisses: s1.memoMisses - s0.memoMisses,
+          editedHits: s2.memoHits - s1.memoHits, editedMisses: s2.memoMisses - s1.memoMisses,
+          verifyFailures: s2.verifyFailures, lumaGhost, lumaGrown: await meanLuma(),
+        };
+        sd.setCasters(base); ghost.dispose(); await frames(10);
+
+        // updateCasterMatrices: a static thin host moves one member without a rebuild. Its shadow
+        // moves (off the ground here, so the frame brightens), only its own footprint re-renders, a
+        // later internal rebuild keeps the new matrices, and a count change is refused.
+        const posts = MeshBuilder.CreateBox("posts", { width: 1, height: 6, depth: 1 }, scene);
+        posts.layerMask = 0x10000000;
+        const postCanon = new Float32Array(32);
+        Matrix.Translation(-12, 3, 6).copyToArray(postCanon, 0);
+        Matrix.Translation(12, 3, 6).copyToArray(postCanon, 16);
+        posts.thinInstanceSetBuffer("matrix", postCanon.slice(), 16, true);
+        sd.setCasters([...base, { mesh: posts, options: { instanceMatrices: postCanon } }]); await frames(30);
+        const lumaPosts = await meanLuma();
+        const calls = { box: 0, all: 0 };
+        // invalidateRange is where every per-box invalidation lands (invalidateBox and setInstanceMatrix).
+        const box0 = sd.core.invalidateRange.bind(sd.core), all0 = sd.core.invalidateAll.bind(sd.core);
+        sd.core.invalidateRange = (...a) => { calls.box++; box0(...a); };
+        sd.core.invalidateAll = () => { calls.all++; all0(); };
+        const builds0 = sd.core.contentSummary.builds;
+        const moved = postCanon.slice();
+        Matrix.Translation(12, 3, -30).copyToArray(moved, 16);
+        const accepted = sd.updateCasterMatrices(posts, moved);
+        const movedCalls = { ...calls };
+        await frames(20);
+        const lumaMoved = await meanLuma();
+        const rebuilt = sd.core.contentSummary.builds !== builds0;
+        sd.core.invalidateRange = box0; sd.core.invalidateAll = all0;
+        // An internal rebuild (addCaster after start) re-registers from the entries: the moved
+        // member must stay moved. The dummy is hidden and casts below the ground.
+        const internal0 = sd.core.contentSummary.internalBuilds;
+        const dummy = MeshBuilder.CreateBox("dummy", { size: 0.1 }, scene); dummy.position.set(0, -0.5, 0); dummy.layerMask = 0x10000000;
+        sd.addCaster(dummy); await frames(20);
+        const lumaInternal = await meanLuma();
+        const internalBuilds = sd.core.contentSummary.internalBuilds - internal0;
+        const stranger = MeshBuilder.CreateBox("stranger", { size: 1 }, scene);
+        r.moveApi = {
+          accepted, calls: movedCalls, rebuilt, lumaPosts, lumaMoved, lumaInternal, internalBuilds,
+          refusedCount: sd.updateCasterMatrices(posts, new Float32Array(48)) === false,
+          refusedUnregistered: sd.updateCasterMatrices(stranger, new Float32Array(16)) === false,
+        };
+        stranger.dispose();
+        // Back where it was: the frame is as before the move.
+        sd.updateCasterMatrices(posts, postCanon); await frames(20);
+        r.moveApi.lumaBack = await meanLuma();
+        sd.verifyRegistrationMemo = false;
+        sd.setCasters(base); posts.dispose(); dummy.dispose(); await frames(10);
       }
       // A moving dynamic caster's shadow follows it (updateDynamics skips casters whose world matrix
       // provably did not change, so every way of moving one must still be seen). Hidden from the camera,
