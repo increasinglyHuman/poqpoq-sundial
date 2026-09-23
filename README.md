@@ -43,6 +43,14 @@ if (SundialBabylon.isSupported(engine)) {
 }
 ```
 
+`sundial.core.stats` holds the page counters (requested, resident, rendered,
+allocation failures, pairs), read back every `core.statsInterval` frames (10).
+GPU pass times (`gpuMarkMs`, `gpuComputeMs`, `gpuRasterMs`) need
+`sundial.core.profiling = true`: with it every pass writes timestamps and every
+frame resolves and maps them, work a shipping app should not pay for, so it is
+off by default and those fields are null. A status panel that shows them turns
+profiling on while it is open.
+
 Don't also attach a shadow generator to the same light. `npm run test:consumer`
 builds the package, installs it into `test/consumer/` exactly as above, and
 checks in real Chrome that the import is harmless on WebGL2 and that shadows
@@ -51,7 +59,8 @@ run on WebGPU.
 URL knobs: `mode=sundial|csm|off`, `tier=medium|high`, `el`, `az`, `speed`
 (sun °/s), `debug=1` (tint by level), `lodBias`, `budget`, `stride`,
 `cam=x,y,z,tx,ty,tz`, `animate=0`, `trees=N`, `rx=onetap|bilinear|nolookup`
-(receiver cost probes).
+(receiver cost probes), `profile=0` (no GPU timestamps; the lab profiles by
+default).
 
 ## How it works
 
