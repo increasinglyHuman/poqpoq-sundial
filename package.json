@@ -1,14 +1,26 @@
 {
   "name": "@poqpoq/sundial",
   "version": "0.1.0",
-  "private": true,
-  "description": "Sundial: paged (virtual) sun shadows for WebGPU \u2014 engine-agnostic core, Babylon.js adapter, benchmark lab",
+  "description": "Sundial: paged (virtual) sun shadows for WebGPU — engine-agnostic core, Babylon.js adapter, benchmark lab",
+  "keywords": [
+    "webgpu",
+    "shadows",
+    "virtual-shadow-maps",
+    "shadow-mapping",
+    "babylonjs",
+    "wgsl",
+    "rendering"
+  ],
   "type": "module",
   "license": "MIT",
   "author": "Allen Partridge (p0qp0q)",
   "repository": {
     "type": "git",
     "url": "https://github.com/increasinglyHuman/poqpoq-sundial.git"
+  },
+  "homepage": "https://github.com/increasinglyHuman/poqpoq-sundial#readme",
+  "bugs": {
+    "url": "https://github.com/increasinglyHuman/poqpoq-sundial/issues"
   },
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -27,6 +39,9 @@
     "dist"
   ],
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build --config vite.lib.config.ts && tsc -p tsconfig.build.json",

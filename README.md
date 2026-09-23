@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/sundial-hero.jpg" alt="poqpoq Sundial" width="420"></p>
+
 # poqpoq-sundial — paged sun shadows for WebGPU
 
 A working virtual (paged) shadow map for one directional light, built for
@@ -13,18 +15,19 @@ node scripts/bench.mjs # interleaved A/B on whatever GPU Chrome picks
 
 ## Using the package
 
-`@poqpoq/sundial` is built like World's other sibling packages
-(`@poqpoq/dozer`, `kudzu`, `paths`): an ES module plus type declarations in
-`dist/`, with `@babylonjs/core` as a peer. Build it, then depend on it by path:
+`@poqpoq/sundial` ships as an ES module plus type declarations in `dist/`:
+the engine-agnostic core at `@poqpoq/sundial` and the Babylon.js adapter at
+`@poqpoq/sundial/babylon`, with `@babylonjs/core` (≥ 9.17.1) as a peer. Until
+it is on npm, build it and depend on it by path:
 
 ```
 npm run build                       # → dist/index.js (core), dist/babylon.js (adapter)
 # in the consuming app's package.json:
-"@poqpoq/sundial": "file:../poqpoq-virtualShadowMapper/lab"
+"@poqpoq/sundial": "file:../poqpoq-sundial"
 ```
 
 The consumer should dedupe Babylon (`resolve.dedupe: ["@babylonjs/core"]` in
-Vite), as World already does for its file-linked packages.
+Vite) so the adapter and the app share one Babylon runtime.
 
 ```ts
 import { SundialBabylon } from "@poqpoq/sundial/babylon";
