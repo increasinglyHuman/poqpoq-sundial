@@ -44,6 +44,9 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.rebuildSame.reusedGeometry === true && res.rebuildSame.invalidated === 0 && res.rebuildSame.luma === res.lumaBase &&
       res.rebuildAdd.invalidated === 1 && res.rebuildAdd.luma < res.lumaBase - 0.05 &&
       res.rebuildRemove.invalidated === 1 && Math.abs(res.rebuildRemove.luma - res.lumaBase) < 0.02 &&
+      // a moving dynamic caster's shadow follows it: moved by its parent, its own position, its thin buffer
+      res.dynamicFollow.atA === "A" && res.dynamicFollow.viaParent === "B" && res.dynamicFollow.viaPosition === "A" &&
+      res.dynamicFollow.thinA === "A" && res.dynamicFollow.thinB === "B" &&
       // requests are per frame: empty sky requests fewer pages than the ground, and they come back
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
       // after dispose, a second instance took over the same materials and is paging
