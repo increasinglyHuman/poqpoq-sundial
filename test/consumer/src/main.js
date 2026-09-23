@@ -299,6 +299,23 @@ try {
       cam.setTarget(target);
       await frames(20);
       r.requestedBack = sd.core.stats.requestedPages;
+      // A receiver past the depth range reads lit, not shadowed. The range is a padded sphere around
+      // the scene (radius ~53 m here), so the sea sits 50 m down, off the (-x, +z) corner: deeper than
+      // the range, still inside the scene's light-space rectangle, and with its sun rays passing
+      // beside the ground (±20), so no caster covers it. With the depth unclamped, every tap failed
+      // against the cleared pool and the patch went dark.
+      {
+        const sea = MeshBuilder.CreateGround("sea", { width: 400, height: 400 }, scene);
+        sea.position.y = -50; sea.material = mat; sea.receiveShadows = true;
+        const pos = cam.position.clone(), look = cam.getTarget().clone();
+        cam.position.set(-45, -30, 45); cam.setTarget(new Vector3(-45.5, -50, 45.5));
+        await frames(30);
+        const shadowed = await meanLuma();
+        sd.setDarkness(1); await frames(5);
+        r.farReceiver = { shadowed, lit: await meanLuma() };
+        sd.setDarkness(0);
+        cam.position.copyFrom(pos); cam.setTarget(look); sea.dispose(); await frames(20);
+      }
       // A host rebuilds its backend (World re-applies on camera swaps and vetoes): dispose, then a
       // new instance on the same scene must take over the materials' existing receivers.
       sd.dispose();
