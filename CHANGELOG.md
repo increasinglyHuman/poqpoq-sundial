@@ -4,7 +4,7 @@ All notable changes to `@poqpoq/sundial`. The project follows
 [semantic versioning](https://semver.org/); while it is 0.x, a minor version
 may change the API.
 
-## Unreleased
+## 0.2.0 — 2026-09-24
 
 ### Core
 
