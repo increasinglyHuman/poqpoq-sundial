@@ -48,7 +48,7 @@ web: no mesh shaders, no bindless, and no engine changes.
 
 ### Status
 
-Version **0.1**. Running in production in poqpoq World since September 2026,
+Version **0.2**. Running in production in poqpoq World since September 2026,
 on the default path for every WebGPU visitor; WebGL2 visitors keep CSM. The
 API may still change within 0.x (see [Limits](#limits-and-known-issues)).
 
@@ -82,6 +82,18 @@ In the field, on a busy poqpoq World community sim, the frame rate went from
 Most of Sundial's remaining cost is in the receivers (material shaders that
 sample the shadow). Producing static shadow depth is ~0.05 ms, and page marking
 is 0.03 ms on the RTX and 0.3–0.4 ms on the Xe-LPG.
+
+**Moving casters (0.2, static cache).** Shadow raster GPU time on the RTX 5060,
+median of 5 interleaved rounds, with the static cache on and off
+(`?cache=0`). A moving caster now redraws only itself over its pages' cached
+static depth, instead of every tree and prim under it:
+
+| | cache on | cache off |
+|---|---|---|
+| village, 40 movers | 0.03 ms | 0.23 ms |
+| forest, 40 movers | 0.05 ms | 0.37 ms |
+| village, 8 skinned walkers | 0.07 ms | 0.25 ms |
+| static scene | 0.01–0.02 ms | 0.00 ms |
 
 ## Using it
 
