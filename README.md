@@ -4,16 +4,27 @@
 
 # poqpoq Sundial — paged sun shadows for WebGPU
 
+**For Babylon.js 9 and three.js** (r186 `WebGPURenderer`), from one package:
+
+```ts
+import { SundialBabylon } from "@poqpoq/sundial/babylon"; // Babylon.js
+import { SundialThree } from "@poqpoq/sundial/three";     // three.js
+```
+
 Sundial is a virtual (paged) shadow map for one directional light, written in
-TypeScript and WGSL for WebGPU. It has an engine-agnostic core that talks only
-to a `GPUDevice`, a Babylon.js 9 adapter and a three.js adapter (r186
-`WebGPURenderer`). It is the default shadow system of
+TypeScript and WGSL for WebGPU. An engine-agnostic core that talks only to a
+`GPUDevice` does the work; each adapter is a thin layer over it, so both
+engines get the same shadows. It is the default shadow system of
 [poqpoq World](https://poqpoq.com/world/) on WebGPU.
 
 **Sharper shadows near the camera, and on integrated GPUs, a lower cost than
-Babylon's cascaded shadow maps.** Measured on an Intel Xe-LPG iGPU, a frame
-with Sundial is 25–32% faster than with `CascadedShadowGenerator` at 3×2048²,
-while its finest texels are 7.8 mm.
+cascaded shadow maps.** Measured on an Intel Xe-LPG iGPU, a frame with Sundial
+is 25–32% faster than Babylon's `CascadedShadowGenerator` at 3×2048², and in
+three.js up to 11% faster than `CSMShadowNode` at 3×2048² (33–41% faster than
+at 4×4096²). Its finest texels are 7.8 mm.
+
+Get started: [Babylon.js](#using-it) · [three.js](#threejs) ·
+[results](#results)
 
 ## About
 
