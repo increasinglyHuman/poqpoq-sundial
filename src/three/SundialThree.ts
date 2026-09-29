@@ -30,7 +30,7 @@ import {
   type Texture,
   type WebGPURenderer,
 } from "three/webgpu";
-import { code, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
+import { code, diffuseColor, float, materialAlphaTest, select, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
 import type { GeometryInput } from "../core/geometry";
 import type { SkinInput } from "../core/skin";
@@ -308,7 +308,14 @@ class SundialShadowNode extends Node {
     if (!host.receiveMaterial(material)) return vec3(1);
     const front = material.side === FrontSide && !(material.transmission! > 0);
     const normal = material.side === DoubleSide || material.side === BackSide ? normalWorldGeometry.mul(faceDirection) : normalWorldGeometry;
-    return (front ? host.receiverFront : host.receiverAny)({ posW: positionWorld, normalW: normal, on: host.enabledNode });
+    // An alpha-tested material's discarded texels still run to the end of the
+    // shader (discard lowers to demote-to-helper), so skip the lookup for
+    // them, with three's own test: a texel is discarded when a <= alphaTest.
+    // Alpha to coverage fades instead of discarding, so it keeps every lookup.
+    const m = material as Material & { alphaTestNode?: Node | null; alphaToCoverage?: boolean };
+    const cutoff = m.alphaToCoverage ? null : m.alphaTestNode ? float(m.alphaTestNode as never) : m.alphaTest > 0 ? materialAlphaTest : null;
+    const on = cutoff ? select(diffuseColor.a.greaterThan(cutoff), host.enabledNode, float(0)) : host.enabledNode;
+    return (front ? host.receiverFront : host.receiverAny)({ posW: positionWorld, normalW: normal, on });
   }
 }
 

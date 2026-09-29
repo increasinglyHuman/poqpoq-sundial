@@ -18,9 +18,10 @@ await renderer.init();
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9fb8d0);
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.3, 600);
-camera.position.set(18, 16, 26);
+const cam = (params.get("cam") ?? "18,16,26,0,1,0").split(",").map(Number);
+camera.position.set(cam[0], cam[1], cam[2]);
 const controls = new OrbitControls(camera, canvas);
-controls.target.set(0, 1, 0);
+controls.target.set(cam[3], cam[4], cam[5]);
 controls.update();
 
 scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x5a4a38, 0.8));
@@ -57,12 +58,32 @@ for (let i = 0; i < 40; i++) {
 posts.castShadow = posts.receiveShadow = true;
 scene.add(posts);
 
+// An alpha-tested card: concentric rings, so its shadow must show the rings, not a square.
+const maskCanvas = document.createElement("canvas");
+maskCanvas.width = maskCanvas.height = 256;
+const mctx = maskCanvas.getContext("2d")!;
+for (let r = 120; r > 0; r -= 20) {
+  mctx.fillStyle = "rgb(90,160,70)";
+  mctx.globalCompositeOperation = (r / 20) % 2 ? "source-over" : "destination-out";
+  mctx.beginPath();
+  mctx.arc(128, 128, r, 0, Math.PI * 2);
+  mctx.fill();
+}
+const card = new THREE.Mesh(
+  new THREE.PlaneGeometry(6, 6),
+  new THREE.MeshStandardMaterial({ map: new THREE.CanvasTexture(maskCanvas), alphaTest: 0.5, side: THREE.DoubleSide }),
+);
+card.position.set(-8, 5, 8);
+card.rotation.x = -0.9;
+card.castShadow = card.receiveShadow = true;
+scene.add(card);
+
 if (!SundialThree.isSupported(renderer)) {
   stats.textContent = "WebGPU not available: Sundial needs WebGPURenderer on WebGPU.";
   throw new Error("no WebGPU");
 }
 const sundial = new SundialThree(renderer, scene, camera, sun, { sceneMin: [-60, -1, -60], sceneMax: [60, 20, 60] });
-sundial.setCasters([...boxes, { mesh: spinner, options: { dynamic: true } }, posts]);
+sundial.setCasters([...boxes, { mesh: spinner, options: { dynamic: true } }, posts, card]);
 sundial.start();
 if (params.get("sundial") === "0") sundial.setEnabled(false);
 if (params.get("debug") === "1") sundial.core.tuning.debugMode = 1;
