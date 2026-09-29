@@ -23,6 +23,8 @@ jobs:
       # The demo's default outDir is dist/, the package's; keep them apart.
       - name: Build the demo
         run: npx vite build --outDir demo-dist
+      - name: Build the Pages site (demo/ and examples/)
+        run: npm run build:pages
       - name: Build the package
         run: npm run build
       - name: Check the package contents
