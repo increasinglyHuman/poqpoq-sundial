@@ -383,18 +383,25 @@ try {
       // Requests are per frame: empty sky requests fewer pages than the
       // ground, and looking back brings the count back up.
       {
-        await renderFrames(10);
-        r.requestedGround = sundial.core.stats.requestedPages;
+        // A low, oblique view of the ground, as the Babylon test uses: close
+        // ground wants fine pages. (From the top-down framing, 38 m up, the
+        // whole patch needs fewer pages than the always-resident coarsest level.)
         const pos = camera.position.clone();
+        const oblique = () => { camera.position.set(0, 3, 10); camera.lookAt(0, 0, 0); camera.updateMatrixWorld(); };
+        oblique();
+        await renderFrames(20);
+        r.requestedGround = sundial.core.stats.requestedPages;
         camera.position.set(0, 1, -2);
         camera.lookAt(0, 50, -2); // straight up: empty sky, no caster or receiver in view
         camera.updateMatrixWorld();
         await renderFrames(20);
         r.requestedSky = sundial.core.stats.requestedPages;
-        camera.position.copy(pos);
-        aimTopDown(0, -2, 16);
+        oblique();
         await renderFrames(20);
         r.requestedBack = sundial.core.stats.requestedPages;
+        camera.position.copy(pos);
+        aimTopDown(0, -2, 16);
+        await renderFrames(10);
       }
 
       // A receiver past the depth range reads lit, not shadowed: the range is
@@ -669,6 +676,9 @@ try {
       // instance on the same scene works. Run LAST and in its own scope: it
       // tears down `sundial`, so nothing above may depend on it afterward.
       {
+        // The frame the first instance shades at this view: the second must match it.
+        await renderFrames(10);
+        const lumaFirst = await meanLuma();
         sundial.dispose();
         const shadow = sun.shadow;
         r.dispose = { noShadowNode: !shadow.shadowNode, castShadowOff: sun.castShadow === false };
@@ -688,7 +698,7 @@ try {
         mat.needsUpdate = true;
         leafMat.needsUpdate = true;
         await renderFrames(20);
-        r.second = { requested: sundial2.core.stats.requestedPages };
+        r.second = { requested: sundial2.core.stats.requestedPages, lumaFirst };
         r.second.luma0 = await meanLuma();
         sundial2.setDarkness(1);
         await renderFrames(5);

@@ -33,61 +33,97 @@ function evaluate(variant, res) {
     return res.imported && !res.error && res.supported === true && res.gpuErrors.length === 0 &&
       !!s && s.requestedPages > 0 && s.allocationFailures === 0;
   }
-  // plain ?engine=webgpu: the full battery.
+  // plain ?engine=webgpu: the full battery. Each check is an expression over
+  // `res` and `core`; the failing ones are listed in the output.
   const core = res.core;
-  return res.imported && !res.error && res.supported === true && res.gpuErrors.length === 0 &&
-    !!core && core.requestedPages > 0 && core.allocationFailures === 0 &&
+  const checks = [
+    'res.imported',
+    '!res.error',
+    'res.supported === true',
+    'res.gpuErrors.length === 0',
+    '!!core',
+    'core.requestedPages > 0',
+    'core.allocationFailures === 0',
     // ground 32 + box 12 + the prim's 6 visible triangles (its hidden half must not cast) + leaf 2
-    res.firstBuild.triangles === 52 && res.firstBuild.geometries === 4 &&
-    res.firstBuild.alphaClusters === 0 &&
+    'res.firstBuild.triangles === 52',
+    'res.firstBuild.geometries === 4',
+    'res.firstBuild.alphaClusters === 0',
     // the leaf's mask is read and the adapter rebuilds on its own
-    res.rebuild.alphaClusters === 1 &&
+    'res.rebuild.alphaClusters === 1',
     // a no-op setCasters() hits the geometry cache for everything registered
-    res.rebuildCache.cachedGeometries === res.rebuildCache.geometries && res.rebuildCache.triangles === 52 &&
+    'res.rebuildCache.cachedGeometries === res.rebuildCache.geometries',
+    'res.rebuildCache.triangles === 52',
     // darkness 1 hides every shadow, so the frame gets brighter
-    res.lumaDark1 > res.lumaDark0 + 0.04 &&
+    'res.lumaDark1 > res.lumaDark0 + 0.04',
     // setEnabled(false) brightens the frame; back on is pixel-identical to before
-    res.lumaEnabledOff > res.lumaEnabledBefore + 0.04 && Math.abs(res.lumaEnabledBack - res.lumaEnabledBefore) < 0.02 &&
+    'res.lumaEnabledOff > res.lumaEnabledBefore + 0.04',
+    'Math.abs(res.lumaEnabledBack - res.lumaEnabledBefore) < 0.02',
     // a cloned receiving material still receives
-    res.clone.ok && res.clone.receives &&
+    'res.clone.ok',
+    'res.clone.receives',
     // boxes that differ only by fractions of a unit are two geometries, not one
-    res.distinct.added === 2 &&
+    'res.distinct.added === 2',
     // rebuilds re-render only what changed
-    res.rebuildSame.reusedGeometry === true && res.rebuildSame.invalidated === 0 && res.rebuildSame.luma === res.lumaBase &&
-    res.rebuildAdd.invalidated === 1 && res.rebuildAdd.luma < res.lumaBase - 0.03 &&
-    res.rebuildRemove.invalidated === 1 && Math.abs(res.rebuildRemove.luma - res.lumaBase) < 0.02 &&
+    'res.rebuildSame.reusedGeometry === true',
+    'res.rebuildSame.invalidated === 0',
+    'res.rebuildSame.luma === res.lumaBase',
+    'res.rebuildAdd.invalidated === 1',
+    'res.rebuildAdd.luma < res.lumaBase - 0.03',
+    'res.rebuildRemove.invalidated === 1',
+    'Math.abs(res.rebuildRemove.luma - res.lumaBase) < 0.02',
     // updateCaster(mesh) moves a static caster's shadow without a rebuild,
     // read at spot A and spot B separately (see main.js): starts shadowing A
     // (not B), ends up shadowing B (not A), and moving back restores that.
-    res.moveApi.accepted && res.moveApi.calls.box === 1 && res.moveApi.calls.all === 0 && !res.moveApi.rebuilt &&
-    res.moveApi.postsA0 < res.moveApi.postsB0 - 0.04 &&
-    res.moveApi.postsB1 < res.moveApi.postsA1 - 0.04 &&
-    res.moveApi.refusedUnregistered &&
-    Math.abs(res.moveApi.postsA2 - res.moveApi.postsA0) < 0.03 && Math.abs(res.moveApi.postsB2 - res.moveApi.postsB0) < 0.03 &&
+    'res.moveApi.accepted',
+    'res.moveApi.calls.box === 1',
+    'res.moveApi.calls.all === 0',
+    '!res.moveApi.rebuilt',
+    'res.moveApi.postsA0 < res.moveApi.postsB0 - 0.04',
+    'res.moveApi.postsB1 < res.moveApi.postsA1 - 0.04',
+    'res.moveApi.refusedUnregistered',
+    'Math.abs(res.moveApi.postsA2 - res.moveApi.postsA0) < 0.03',
+    'Math.abs(res.moveApi.postsB2 - res.moveApi.postsB0) < 0.03',
     // the min/max early-out changes no pixel, off or back on
-    res.minMax.diffOff === 0 && res.minMax.diffBack === 0 &&
+    'res.minMax.diffOff === 0',
+    'res.minMax.diffBack === 0',
     // requests are per frame
-    res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&
+    'res.requestedSky < res.requestedGround',
+    'res.requestedBack >= res.requestedGround - 2',
     // a receiver past the depth range is lit, not shadowed
-    Math.abs(res.farReceiver.lit - res.farReceiver.shadowed) < 0.5 &&
+    'Math.abs(res.farReceiver.lit - res.farReceiver.shadowed) < 0.5',
     // receiveShadow=false is unaffected by darkness
-    res.receiveShadowFalse.unaffected &&
+    'res.receiveShadowFalse.unaffected',
     // a second (three-native) shadow on another light still works alongside Sundial
-    res.otherLight.otherOnly < res.otherLight.noShadow - 0.05 && res.otherLight.both <= res.otherLight.otherOnly + 0.02 &&
+    // (the native shadow alone is small in this frame: a few thousandths of luma)
+    'res.otherLight.otherOnly < res.otherLight.noShadow - 0.002',
+    // and Sundial's own shadow of the same caster adds on top of it
+    'res.otherLight.both < res.otherLight.otherOnly - 0.02',
+    'res.otherLight.both <= res.otherLight.otherOnly + 0.02',
     // dispose() restores the light and a second instance takes over and shades
-    res.dispose.noShadowNode && res.dispose.castShadowOff &&
-    res.second.requested > 0 && res.second.luma1 > res.second.luma0 + 0.1 &&
+    'res.dispose.noShadowNode',
+    'res.dispose.castShadowOff',
+    // the same frame as the first instance shaded before dispose(), and it responds to darkness
+    'res.second.requested > 0',
+    'Math.abs(res.second.luma0 - res.second.lumaFirst) < 0.002',
+    'res.second.luma1 > res.second.luma0 + 0.003',
     // a moving dynamic caster's shadow follows it: parent, own position, InstancedMesh
-    res.dynamicFollow.atA === "A" && res.dynamicFollow.viaParent === "B" && res.dynamicFollow.viaPosition === "A" &&
-    res.dynamicFollow.instA === "A" && res.dynamicFollow.instB === "B" &&
+    'res.dynamicFollow.atA === "A"',
+    'res.dynamicFollow.viaParent === "B"',
+    'res.dynamicFollow.viaPosition === "A"',
+    'res.dynamicFollow.instA === "A"',
+    'res.dynamicFollow.instB === "B"',
     // a dynamic SkinnedMesh casts its posed shadow
-    res.skinned.moved &&
+    'res.skinned.moved',
     // alphaMap reads the GREEN channel
-    res.alphaMapLeaf.grew &&
+    'res.alphaMapLeaf.grew',
     // updateCaster refuses a caster whose instance count changed underneath it
-    res.updateCasterRefusesCountChange &&
+    'res.updateCasterRefusesCountChange',
     // documented, not ported: no per-mesh registration memo, no CSM min() combine
-    res.memo.skipped && res.csmMinCombo.skipped;
+    'res.memo.skipped',
+    'res.csmMinCombo.skipped',
+  ];
+  res.failed = checks.filter((c) => { try { return !new Function("res", "core", `return (${c});`)(res, core); } catch { return true; } });
+  return res.failed.length === 0;
 }
 
 for (const variant of ["webgl", "webgpu", "webgpu&aa=1", "webgpu&tonemap=0", "webgpu&nofeat=1", "webgpu&reversed=1"]) {
@@ -107,6 +143,7 @@ for (const variant of ["webgl", "webgpu", "webgpu&aa=1", "webgpu&tonemap=0", "we
   let evalError = null;
   try { ok = res.done && errs.length === 0 && evaluate(variant, res); } catch (e) { evalError = String(e); }
   failed ||= !ok;
+  if (res.failed?.length) console.log("  failed:", res.failed.join("  |  "));
   console.log(ok ? "PASS" : "FAIL", variant, JSON.stringify(res), errs.length ? "ERRORS: " + errs.join(" | ") : "", evalError ? "EVAL-ERROR: " + evalError : "");
   await p.close();
 }

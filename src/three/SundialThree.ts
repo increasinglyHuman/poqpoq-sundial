@@ -30,7 +30,7 @@ import {
   type Texture,
   type WebGPURenderer,
 } from "three/webgpu";
-import { code, diffuseColor, float, materialAlphaTest, select, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
+import { code, renderGroup, diffuseColor, float, materialAlphaTest, select, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
 import type { GeometryInput } from "../core/geometry";
 import type { SkinInput } from "../core/skin";
@@ -290,22 +290,33 @@ const PS_PARAMS_TYPE = {
   build: () => "PsParams",
 };
 
+/** The three-side objects an instance binds its core's GPU resources through. */
+interface Bindings {
+  params: StorageBufferAttribute;
+  table: StorageBufferAttribute;
+  pool: DepthTexture;
+  minMax: ExternalTexture;
+}
+
+/** Gives each new instance's textures a version no earlier binding has seen. */
+let textureVersions = 0;
+
 /**
  * The shadow factor for one light, as `light.shadow.shadowNode`: an RGB
  * factor three multiplies the light's colour by. Grey in normal use; in debug
- * mode, the sampled level's colour (psApply). Specialised
- * per material at build time: opaque one-sided materials skip the lookup for
- * faces turned away from the sun.
+ * mode, the sampled level's colour (psApply). Specialised per material at
+ * build time: opaque one-sided materials skip the lookup for faces turned
+ * away from the sun.
  */
 class SundialShadowNode extends Node {
-  constructor(private readonly host: SundialThree) {
+  constructor(private readonly receiver: Receiver) {
     super("vec3");
   }
 
   override setup(builder: NodeBuilder) {
     const material = builder.material as Material & { transmission?: number };
-    const host = this.host;
-    if (!host.receiveMaterial(material)) return vec3(1);
+    const r = this.receiver;
+    if (!r.host.receiveMaterial(material)) return vec3(1);
     const front = material.side === FrontSide && !(material.transmission! > 0);
     const normal = material.side === DoubleSide || material.side === BackSide ? normalWorldGeometry.mul(faceDirection) : normalWorldGeometry;
     // An alpha-tested material's discarded texels still run to the end of the
@@ -314,10 +325,75 @@ class SundialShadowNode extends Node {
     // Alpha to coverage fades instead of discarding, so it keeps every lookup.
     const m = material as Material & { alphaTestNode?: Node | null; alphaToCoverage?: boolean };
     const cutoff = m.alphaToCoverage ? null : m.alphaTestNode ? float(m.alphaTestNode as never) : m.alphaTest > 0 ? materialAlphaTest : null;
-    const on = cutoff ? select(diffuseColor.a.greaterThan(cutoff), host.enabledNode, float(0)) : host.enabledNode;
-    return (front ? host.receiverFront : host.receiverAny)({ posW: positionWorld, normalW: normal, on });
+    const on = cutoff ? select(diffuseColor.a.greaterThan(cutoff), r.enabled, float(0)) : r.enabled;
+    return (front ? r.front : r.any)({ posW: positionWorld, normalW: normal, on });
   }
 }
+
+/**
+ * The receiver for one light, for the light's life: its shadow node, WGSL and
+ * binding nodes, shared by every instance that runs on the light in turn.
+ * three caches each material's build under a key made of the material and
+ * each light's id and castShadow, nothing Sundial controls, so a second
+ * instance with its own nodes would be handed the first one's cached build,
+ * bound to destroyed buffers; and three's light node keeps the first shadow
+ * node it sees. So the nodes stay, and a new instance swaps its own buffers
+ * and textures into them: three rebuilds a bind group when a binding's
+ * attribute object or texture (by version) changes, and the cached shader,
+ * identical code, stays valid.
+ */
+class Receiver {
+  host: SundialThree;
+  /**
+   * 1 = shadows on. In the render group, refreshed every render call: an
+   * object-group uniform is not re-uploaded when only its JS value changes.
+   */
+  readonly enabled = uniform(1).setGroup(renderGroup);
+  readonly node: SundialShadowNode;
+  readonly any;
+  readonly front;
+  private readonly params;
+  private readonly table;
+  private readonly pool;
+  private readonly minMax;
+
+  constructor(host: SundialThree, b: Bindings) {
+    this.host = host;
+    this.params = storage(b.params, PS_PARAMS_TYPE as never, 0).toReadOnly().setName("psParams");
+    this.table = storage(b.table, "uvec2", 1).toReadOnly().setName("psPageTable");
+    this.pool = texture(b.pool).setName("psPool");
+    this.minMax = texture(b.minMax).setName("psMinMax");
+    const bindings = code(receiverCode(), [this.params, this.table, this.pool, this.minMax], "wgsl");
+    this.any = wgslFn(
+      `fn sundialShadow(posW: vec3f, normalW: vec3f, on: f32) -> vec3f {
+  if (on < 0.5) { return vec3f(1.0); }
+  return psApply(vec3f(1.0), psShadow(posW, normalW));
+}`,
+      [bindings],
+    );
+    this.front = wgslFn(
+      `fn sundialShadowFront(posW: vec3f, normalW: vec3f, on: f32) -> vec3f {
+  if (on < 0.5) { return vec3f(1.0); }
+  return psApply(vec3f(1.0), psShadowFront(posW, normalW));
+}`,
+      [bindings],
+    );
+    this.node = new SundialShadowNode(this);
+  }
+
+  /** Point every binding at `host`'s resources. */
+  bind(host: SundialThree, b: Bindings): void {
+    if (this.host === host) return;
+    this.host = host;
+    (this.params as unknown as { value: StorageBufferAttribute }).value = b.params;
+    (this.table as unknown as { value: StorageBufferAttribute }).value = b.table;
+    b.pool.version = b.minMax.version = ++textureVersions;
+    (this.pool as unknown as { value: Texture }).value = b.pool;
+    (this.minMax as unknown as { value: Texture }).value = b.minMax;
+  }
+}
+
+const receivers = new WeakMap<DirectionalLight, Receiver>();
 
 export class SundialThree {
   readonly core: PagedShadowCore;
@@ -327,13 +403,11 @@ export class SundialThree {
   /** The camera whose depth drives page marking and whose position picks the level. */
   camera: Camera;
 
-  /** @internal */ readonly enabledNode = uniform(1);
-  /** @internal */ readonly receiverAny;
-  /** @internal */ readonly receiverFront;
   /** @internal */ readonly receiveMaterial: (material: Material) => boolean;
 
-  private readonly shadowNode: SundialShadowNode;
-  private readonly externals: { dispose(): void }[] = [];
+  private readonly bindings: Bindings;
+  private receiver: Receiver | null = null;
+  private on = true;
   private entries: { mesh: Mesh; options: CasterOptions }[] = [];
   private tracked: Tracked[] = [];
   private readonly statics = new Map<Mesh, { groups: InstanceGroup[]; last: Float32Array }[]>();
@@ -377,7 +451,8 @@ export class SundialThree {
     const backend = backendOf(renderer);
     this.core = new PagedShadowCore(backend.device!, { maxAlphaLayers: 16, ...options });
 
-    // The four bindings, backed by the core's own GPU objects. three allocates
+    // The four bindings, backed by the core's own GPU objects (bound into the
+    // light's Receiver at start()). three allocates
     // a storage buffer only when its side-table row is empty, so filling the
     // row first makes three bind ours. It never writes them: their versions
     // never change. ExternalTexture is three's own route for a GPUTexture it
@@ -400,29 +475,7 @@ export class SundialThree {
     minMax.type = UnsignedIntType;
     minMax.minFilter = minMax.magFilter = NearestFilter;
     minMax.generateMipmaps = false;
-    this.externals.push(pool, minMax);
-
-    const bindings = code(receiverCode(), [
-      storage(paramsAttr, PS_PARAMS_TYPE as never, 0).toReadOnly().setName("psParams"),
-      storage(tableAttr, "uvec2", 1).toReadOnly().setName("psPageTable"),
-      texture(pool).setName("psPool"),
-      texture(minMax).setName("psMinMax"),
-    ], "wgsl");
-    this.receiverAny = wgslFn(
-      `fn sundialShadow(posW: vec3f, normalW: vec3f, on: f32) -> vec3f {
-  if (on < 0.5) { return vec3f(1.0); }
-  return psApply(vec3f(1.0), psShadow(posW, normalW));
-}`,
-      [bindings],
-    );
-    this.receiverFront = wgslFn(
-      `fn sundialShadowFront(posW: vec3f, normalW: vec3f, on: f32) -> vec3f {
-  if (on < 0.5) { return vec3f(1.0); }
-  return psApply(vec3f(1.0), psShadowFront(posW, normalW));
-}`,
-      [bindings],
-    );
-    this.shadowNode = new SundialShadowNode(this);
+    this.bindings = { params: paramsAttr, table: tableAttr, pool, minMax };
   }
 
   /**
@@ -494,13 +547,14 @@ export class SundialThree {
   }
 
   get enabled(): boolean {
-    return this.enabledNode.value === 1;
+    return this.on;
   }
 
   /** Off: receivers fall back to plain unshadowed sun light (for A/B). No shader recompiles either way. */
   setEnabled(on: boolean): void {
     if (on && !this.enabled) this.core.invalidateAll();
-    this.enabledNode.value = on ? 1 : 0;
+    this.on = on;
+    if (this.receiver?.host === this) this.receiver.enabled.value = on ? 1 : 0;
   }
 
   /** Upload content, attach the receiver to the light, and start running every frame. */
@@ -512,7 +566,12 @@ export class SundialThree {
     // shadow node is read. Nothing renders a shadow map for it.
     this.renderer.shadowMap.enabled = true;
     this.light.castShadow = true;
-    (this.light.shadow as unknown as { shadowNode: Node }).shadowNode = this.shadowNode;
+    let receiver = receivers.get(this.light);
+    if (!receiver) receivers.set(this.light, (receiver = new Receiver(this, this.bindings)));
+    else receiver.bind(this, this.bindings);
+    receiver.enabled.value = this.on ? 1 : 0;
+    this.receiver = receiver;
+    (this.light.shadow as unknown as { shadowNode: Node }).shadowNode = receiver.node;
     const hooks = this.scene as unknown as SceneHooks;
     const before = (this.previousBefore = hooks.onBeforeRender);
     const after = (this.previousAfter = hooks.onAfterRender);
@@ -535,11 +594,15 @@ export class SundialThree {
       if (this.previousBefore) hooks.onBeforeRender = this.previousBefore;
       if (this.previousAfter) hooks.onAfterRender = this.previousAfter;
       const shadow = this.light.shadow as unknown as { shadowNode?: Node };
-      if (shadow.shadowNode === this.shadowNode) delete shadow.shadowNode;
-      this.light.castShadow = false;
+      // Only if no newer instance has taken the light over.
+      if (this.receiver?.host === this) {
+        if (shadow.shadowNode === this.receiver.node) delete shadow.shadowNode;
+        this.light.castShadow = false;
+      }
     }
     this.running = false;
-    for (const t of this.externals) t.dispose();
+    this.bindings.pool.dispose();
+    this.bindings.minMax.dispose();
     this.core.dispose();
   }
 
