@@ -1,6 +1,6 @@
 {
   "name": "@poqpoq/sundial",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Sundial: paged (virtual) sun shadows for WebGPU — engine-agnostic core, Babylon.js and three.js adapters, benchmark lab",
   "keywords": [
     "webgpu",

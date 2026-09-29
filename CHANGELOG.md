@@ -4,13 +4,19 @@ All notable changes to `@poqpoq/sundial`. The project follows
 [semantic versioning](https://semver.org/); while it is 0.x, a minor version
 may change the API.
 
-## Unreleased
+## 0.4.0 — 2026-09-29
 
 ### three.js adapter
 
 - `blendShadowMap` option: three's own shadow map for the sun is folded in with
   `min()`, for casters Sundial doesn't suit (e.g. many animated characters).
 - `castersIn(root, filter?)` takes a filter.
+
+### Docs and demo
+
+- The README leads with both engines.
+- A live three.js demo on GitHub Pages (`demo/`) and a minimal example
+  (`examples/three-basic/`).
 
 ## 0.3.0 — 2026-09-28
 
