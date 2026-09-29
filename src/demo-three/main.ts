@@ -47,7 +47,7 @@ for (let i = 0; i < 6; i++) {
 const spinner = new THREE.Mesh(new THREE.TorusKnotGeometry(1.6, 0.5, 128, 16), new THREE.MeshStandardMaterial({ color: 0x7aa2c9 }));
 spinner.position.set(4, 4, 6);
 spinner.castShadow = spinner.receiveShadow = true;
-scene.add(spinner);
+if (params.get("spinner") !== "0") scene.add(spinner);
 
 const posts = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.2, 0.2, 3, 12), new THREE.MeshStandardMaterial({ color: 0x6b5a4a }), 40);
 const m = new THREE.Matrix4();
@@ -78,13 +78,46 @@ card.rotation.x = -0.9;
 card.castShadow = card.receiveShadow = true;
 scene.add(card);
 
+// A skinned column (two bones) bound away from the origin, so bindMatrix is not
+// identity; the upper bone bends over time. Its shadow must bend with it.
+const colGeo = new THREE.BoxGeometry(1, 6, 1, 1, 12, 1).translate(0, 3, 0);
+const skinIndex: number[] = [];
+const skinWeight: number[] = [];
+const cp = colGeo.getAttribute("position");
+for (let i = 0; i < cp.count; i++) {
+  const w = THREE.MathUtils.clamp((cp.getY(i) - 2) / 2, 0, 1);
+  skinIndex.push(0, 1, 0, 0);
+  skinWeight.push(1 - w, w, 0, 0);
+}
+colGeo.setAttribute("skinIndex", new THREE.Uint16BufferAttribute(skinIndex, 4));
+colGeo.setAttribute("skinWeight", new THREE.Float32BufferAttribute(skinWeight, 4));
+const root = new THREE.Bone();
+const upper = new THREE.Bone();
+upper.position.y = 3;
+root.add(upper);
+const column = new THREE.SkinnedMesh(colGeo, new THREE.MeshStandardMaterial({ color: 0xc97a7a }));
+column.position.set(10, 0, 8);
+column.rotation.y = 0.6;
+column.add(root);
+column.updateMatrixWorld(true);
+column.bind(new THREE.Skeleton([root, upper]));
+column.castShadow = column.receiveShadow = true;
+scene.add(column);
+
 if (!SundialThree.isSupported(renderer)) {
   stats.textContent = "WebGPU not available: Sundial needs WebGPURenderer on WebGPU.";
   throw new Error("no WebGPU");
 }
 const sundial = new SundialThree(renderer, scene, camera, sun, { sceneMin: [-60, -1, -60], sceneMax: [60, 20, 60] });
-sundial.setCasters([...boxes, { mesh: spinner, options: { dynamic: true } }, posts, card]);
-sundial.start();
+sundial.setCasters([...boxes, { mesh: spinner, options: { dynamic: true } }, posts, card, { mesh: column, options: { dynamic: true } }]);
+if (params.get("mode") === "three") {
+  // Reference: three's own shadow map for the sun, no Sundial.
+  renderer.shadowMap.enabled = true;
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(4096, 4096);
+  Object.assign(sun.shadow.camera, { left: -40, right: 40, top: 40, bottom: -40, near: 1, far: 150 });
+  sun.shadow.camera.updateProjectionMatrix();
+} else sundial.start();
 if (params.get("sundial") === "0") sundial.setEnabled(false);
 if (params.get("debug") === "1") sundial.core.tuning.debugMode = 1;
 
@@ -120,6 +153,7 @@ let last = performance.now();
 renderer.setAnimationLoop((time) => {
   spinner.rotation.set(time * 0.0007, time * 0.0011, 0);
   spinner.position.x = 4 + Math.sin(time * 0.0005) * 6;
+  upper.rotation.z = params.get("bend") ? Number(params.get("bend")) : Math.sin(time * 0.0012) * 1.1;
   controls.update();
   renderer.render(scene, camera);
   frames++;
