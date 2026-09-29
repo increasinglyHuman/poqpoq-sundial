@@ -23,8 +23,9 @@ is 25–32% faster than Babylon's `CascadedShadowGenerator` at 3×2048², and in
 three.js up to 11% faster than `CSMShadowNode` at 3×2048² (33–41% faster than
 at 4×4096²). Its finest texels are 7.8 mm.
 
-Get started: [Babylon.js](#using-it) · [three.js](#threejs) ·
-[results](#results)
+**[Live three.js demo](https://increasinglyhuman.github.io/poqpoq-sundial/)**
+(needs a WebGPU browser) · get started: [Babylon.js](#using-it) ·
+[three.js](#threejs) · [results](#results)
 
 ## About
 
@@ -218,6 +219,10 @@ two adapters are the worked examples.
 ```
 npm install @poqpoq/sundial three
 ```
+
+Try it first: the [live demo](https://increasinglyhuman.github.io/poqpoq-sundial/),
+and a [minimal example](https://increasinglyhuman.github.io/poqpoq-sundial/examples/three-basic/)
+([source](examples/three-basic/main.js)) to copy from.
 
 three r186 (tested; the peer range also admits r187), `WebGPURenderer` on its
 WebGPU backend. The receiver is
