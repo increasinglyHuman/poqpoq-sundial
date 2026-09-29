@@ -383,6 +383,11 @@ export class SundialThree {
     const pool = new DepthTexture(this.core.poolSize, this.core.poolSize, FloatType);
     Object.assign(pool, { isExternalTexture: true, sourceTexture: this.core.poolTexture });
     pool.minFilter = pool.magFilter = NearestFilter;
+    // Until a depth texture has a GPU texture, three assumes the renderer's
+    // MSAA sample count for it (a depth texture is normally the canvas's), and
+    // with antialias on it would declare the pool multisampled. Filling the
+    // row now makes it read the pool's real sample count, 1.
+    backend.get(pool).texture = this.core.poolTexture;
     const minMax = new ExternalTexture(this.core.minMaxTexture);
     minMax.format = RGIntegerFormat;
     minMax.type = UnsignedIntType;
@@ -701,7 +706,8 @@ export class SundialThree {
     const camera = this.camera;
     this.invViewProj.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
     const encoder = this.core.device.createCommandEncoder({ label: "ps.markThree" });
-    this.core.markInto(encoder, { texture: gpu, invViewProj: this.invViewProj.elements });
+    const reversed = !!(this.renderer as unknown as { reversedDepthBuffer?: boolean }).reversedDepthBuffer;
+    this.core.markInto(encoder, { texture: gpu, invViewProj: this.invViewProj.elements, reversed });
     this.core.device.queue.submit([encoder.finish()]);
   }
 

@@ -1,6 +1,7 @@
 // @poqpoq/sundial — engine-agnostic core. Talks only to a GPUDevice.
 export { PagedShadowCore } from "./core/PagedShadowCore";
 export type {
+  DepthInput,
   FrameInput,
   InstanceGroup,
   PagedShadowOptions,

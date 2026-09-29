@@ -10,7 +10,7 @@ const params = new URLSearchParams(location.search);
 const canvas = document.getElementById("view") as HTMLCanvasElement;
 const stats = document.getElementById("stats")!;
 
-const renderer = new THREE.WebGPURenderer({ canvas, antialias: params.get("aa") === "1" });
+const renderer = new THREE.WebGPURenderer({ canvas, antialias: params.get("aa") === "1", reversedDepthBuffer: params.get("reversed") === "1" });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight, false);
 await renderer.init();
