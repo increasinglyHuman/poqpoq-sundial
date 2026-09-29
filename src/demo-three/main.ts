@@ -65,6 +65,7 @@ const sundial = new SundialThree(renderer, scene, camera, sun, { sceneMin: [-60,
 sundial.setCasters([...boxes, { mesh: spinner, options: { dynamic: true } }, posts]);
 sundial.start();
 if (params.get("sundial") === "0") sundial.setEnabled(false);
+if (params.get("debug") === "1") sundial.core.tuning.debugMode = 1;
 
 const toggle = document.getElementById("toggle")!;
 toggle.className = sundial.enabled ? "on" : "";

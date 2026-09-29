@@ -30,7 +30,7 @@ import {
   type Texture,
   type WebGPURenderer,
 } from "three/webgpu";
-import { code, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
+import { code, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
 import type { GeometryInput } from "../core/geometry";
 import type { SkinInput } from "../core/skin";
@@ -291,19 +291,21 @@ const PS_PARAMS_TYPE = {
 };
 
 /**
- * The shadow factor for one light, as `light.shadow.shadowNode`. Specialised
+ * The shadow factor for one light, as `light.shadow.shadowNode`: an RGB
+ * factor three multiplies the light's colour by. Grey in normal use; in debug
+ * mode, the sampled level's colour (psApply). Specialised
  * per material at build time: opaque one-sided materials skip the lookup for
  * faces turned away from the sun.
  */
 class SundialShadowNode extends Node {
   constructor(private readonly host: SundialThree) {
-    super("float");
+    super("vec3");
   }
 
   override setup(builder: NodeBuilder) {
     const material = builder.material as Material & { transmission?: number };
     const host = this.host;
-    if (!host.receiveMaterial(material)) return uniform(1);
+    if (!host.receiveMaterial(material)) return vec3(1);
     const front = material.side === FrontSide && !(material.transmission! > 0);
     const normal = material.side === DoubleSide || material.side === BackSide ? normalWorldGeometry.mul(faceDirection) : normalWorldGeometry;
     return (front ? host.receiverFront : host.receiverAny)({ posW: positionWorld, normalW: normal, on: host.enabledNode });
@@ -395,16 +397,16 @@ export class SundialThree {
       texture(minMax).setName("psMinMax"),
     ], "wgsl");
     this.receiverAny = wgslFn(
-      `fn sundialShadow(posW: vec3f, normalW: vec3f, on: f32) -> f32 {
-  if (on < 0.5) { return 1.0; }
-  return psShadow(posW, normalW);
+      `fn sundialShadow(posW: vec3f, normalW: vec3f, on: f32) -> vec3f {
+  if (on < 0.5) { return vec3f(1.0); }
+  return psApply(vec3f(1.0), psShadow(posW, normalW));
 }`,
       [bindings],
     );
     this.receiverFront = wgslFn(
-      `fn sundialShadowFront(posW: vec3f, normalW: vec3f, on: f32) -> f32 {
-  if (on < 0.5) { return 1.0; }
-  return psShadowFront(posW, normalW);
+      `fn sundialShadowFront(posW: vec3f, normalW: vec3f, on: f32) -> vec3f {
+  if (on < 0.5) { return vec3f(1.0); }
+  return psApply(vec3f(1.0), psShadowFront(posW, normalW));
 }`,
       [bindings],
     );
