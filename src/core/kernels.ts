@@ -588,7 +588,8 @@ fn markPages(@builtin(global_invocation_id) gid: vec3u) {
   let size = vec2u(psParams.screen.xy);
   if (px.x >= size.x || px.y >= size.y) { return; }
   let d = textureLoad(depthTex, vec2i(px), 0);
-  if (d >= 1.0) { return; }
+  // Nothing drawn here: the cleared far plane (1, or 0 with reversed-Z).
+  if (select(d >= 1.0, d <= 0.0, psParams.screen.w > 1.5)) { return; }
   let ndc = vec4f((f32(px.x) + 0.5) / f32(size.x) * 2.0 - 1.0, 1.0 - (f32(px.y) + 0.5) / f32(size.y) * 2.0, d, 1.0);
   let h = psParams.invViewProj * ndc;
   let pos = h.xyz / h.w;

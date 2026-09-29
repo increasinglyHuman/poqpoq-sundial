@@ -95,6 +95,25 @@ static depth, instead of every tree and prim under it:
 | village, 8 skinned walkers | 0.07 ms | 0.25 ms |
 | static scene | 0.01–0.02 ms | 0.00 ms |
 
+**three.js (0.3).** The same scene in the three.js lab (`three.html`: three
+r186 `WebGPURenderer`, 4× MSAA, 1600×900), against three's own
+`CSMShadowNode` at the same cascade counts and map sizes. Median of 3
+interleaved rounds of 3 s, taken 2026-09-28; the Xe-LPG was in its fast state
+(shadows off 3.84 ms, the same as the Babylon lab that session).
+
+Frame time in ms (lower is better):
+
+| | Xe-LPG village | Xe-LPG overview | Xe-LPG forest | RTX 5060 village | RTX 5060 overview | RTX 5060 forest |
+|---|---|---|---|---|---|---|
+| shadows off | 3.84 | 3.96 | 3.53 | 1.08 | 1.34 | 1.00 |
+| CSMShadowNode 3×2048² | 7.08 | 6.76 | 6.62 | 2.96 | 3.47 | 3.17 |
+| CSMShadowNode 4×4096² | 10.77 | 9.92 | 9.98 | 8.46 | 6.57 | 7.07 |
+| **Sundial** | **6.43** | **6.69** | **5.89** | **2.56** | **3.36** | **2.33** |
+
+Sundial's own passes cost the same as under Babylon (marking 0.3–0.4 ms on
+the Xe-LPG, paging and static raster ~0.04 ms). In the same session the
+Babylon lab's Sundial frame was 7.11 / 7.41 / 6.24 ms on the Xe-LPG.
+
 ## Using it
 
 ```
@@ -102,10 +121,12 @@ npm install @poqpoq/sundial @babylonjs/core
 ```
 
 `@poqpoq/sundial` is an ES module with type declarations: the engine-agnostic
-core at `@poqpoq/sundial` and the Babylon.js adapter at
-`@poqpoq/sundial/babylon`, with `@babylonjs/core` 9 (≥ 9.17.1) as a peer. Let
-your bundler dedupe Babylon (Vite: `resolve.dedupe: ["@babylonjs/core"]`) so
-the adapter and your app share one Babylon runtime.
+core at `@poqpoq/sundial`, the Babylon.js adapter at `@poqpoq/sundial/babylon`
+and the three.js adapter at `@poqpoq/sundial/three` (see [three.js](#threejs)).
+Both engines are optional peers: install the one you use. For Babylon,
+`@babylonjs/core` 9 (≥ 9.17.1); let your bundler dedupe it (Vite:
+`resolve.dedupe: ["@babylonjs/core"]`) so the adapter and your app share one
+Babylon runtime.
 
 ```ts
 import { SundialBabylon } from "@poqpoq/sundial/babylon";
@@ -174,9 +195,60 @@ Just don't give both the same casters.
 (positions, indices, optional UVs and alpha layer, optional skin influences),
 instance matrices (`setSkinPose` poses a skinned instance), and per
 frame the eye, sun direction, and the camera's depth texture with its
-inverse view-projection matrix. It exports its receiver WGSL (`COMMON_WGSL`,
-`RECEIVER_WGSL`) for your own materials. The Babylon adapter is the worked
-example; a three.js adapter is planned.
+inverse view-projection matrix (`reversed: true` for reversed-Z). It exports
+its receiver WGSL (`COMMON_WGSL`, `RECEIVER_WGSL`) for your own materials. The
+two adapters are the worked examples.
+
+### three.js
+
+```
+npm install @poqpoq/sundial three
+```
+
+three r186 (tested; the peer range also admits r187), `WebGPURenderer` on its
+WebGPU backend. The receiver is
+the sun's `light.shadow.shadowNode`, the hook three's own `CSMShadowNode`
+uses, so every node material that receives shadows from that light (including
+the classic `MeshStandardMaterial` family, which WebGPURenderer turns into node
+materials) takes Sundial's shadow with no per-material setup. three renders no
+shadow map of its own for that light; other lights keep theirs.
+
+```ts
+import * as THREE from "three/webgpu";
+import { SundialThree } from "@poqpoq/sundial/three";
+
+const renderer = new THREE.WebGPURenderer({ antialias: true });
+await renderer.init();
+if (SundialThree.isSupported(renderer)) {                          // false on the WebGL2 fallback
+  const sundial = new SundialThree(renderer, scene, camera, sun, { sceneMin: [-128, -10, -128], sceneMax: [128, 60, 128] });
+  sundial.addCaster(terrain);                                       // static
+  sundial.addCaster(leaves);                                        // InstancedMesh, alpha-tested: mask read from its material
+  sundial.addCaster(windmill, { dynamic: true });                   // re-read every frame
+  sundial.addCaster(avatar, { dynamic: true });                     // SkinnedMesh: casts its skinned pose
+  // or: sundial.setCasters(SundialThree.castersIn(scene));         // every visible mesh with castShadow
+  sundial.start();                                                  // meshes receive with receiveShadow, as usual
+}
+```
+
+- **Casters** are registered explicitly, as with Babylon: a caster keeps
+  casting while registered, whether or not it is in the scene or visible.
+  `castersIn(root)` collects the meshes marked `castShadow`. `InstancedMesh`
+  casts every instance (dynamic ones follow `count` up to `capacity`).
+  Geometry groups whose material is missing or invisible do not cast.
+- **Alpha-tested casters.** A material with `alphaTest > 0` casts through its
+  `alphaMap` (green channel, as three reads it) or else its `map` (alpha),
+  with the texture's `offset`/`repeat`/`rotation` and `flipY` applied. The
+  mask is read once, from the texture's image, on the CPU; compressed
+  textures cast opaque.
+- **Skinned casters.** A dynamic `SkinnedMesh` casts its pose, skinned on the
+  GPU from `skeleton.boneMatrices` with the mesh's `bindMatrix`. 4 influences,
+  256 bones. `updateCaster(mesh)` moves a static caster without a rebuild.
+- **Renderer settings.** `antialias` (multisampled depth), `reversedDepthBuffer`
+  and post-processing all work: marking reads the depth of whatever target
+  the camera rendered into. `setEnabled(false)` is a uniform flip, with no
+  shader recompile.
+- `setDarkness`, `setSceneBounds`, `core.tuning`, `core.stats` and `dispose()`
+  work as in the Babylon adapter.
 
 ## How it works
 
@@ -258,6 +330,28 @@ API, which is why the peer range is pinned to Babylon 9.
 - `wrapWebGPUTexture` (public) for the pool; `WebGPUDataBuffer` for storage
   buffer bindings.
 
+### Seams into three.js
+
+All in `src/three/SundialThree.ts`. three's backend keeps each object's GPU
+resources in a side table, and the adapter fills some rows itself, which is
+why the peer range is narrow: r186 is tested, and r187 is admitted pending a
+check when it ships.
+
+- `renderer.backend.device`: the core runs on three's `GPUDevice`, from its own
+  command encoders.
+- Storage buffers: two `StorageBufferAttribute`s whose backend rows are filled
+  with the core's `GPUBuffer`s before first use. three allocates only when the
+  row is empty, and never writes them (their versions never change). The
+  params buffer is declared with Sundial's own `PsParams` struct.
+- Textures: the pool and min/max atlas are three `ExternalTexture`s (the pool
+  a `DepthTexture` flagged the same way, so it declares as `texture_depth_2d`).
+  The pool's row is also filled early: until a depth texture has a GPU
+  texture, three assumes the renderer's MSAA sample count for it.
+- `scene.onBeforeRender` / `onAfterRender` (chained, restored on `dispose`):
+  paging before the camera renders, page marking after, reading the camera's
+  depth from the canvas target, the target's `depthTexture`, or the depth
+  three keeps for its internal framebuffer target (`renderer._textures`).
+
 ### Upstream Babylon fixes
 
 Sundial's work turned up two Babylon bugs, fixed upstream and approved by the
@@ -276,11 +370,16 @@ Babylon team, awaiting merge:
 
 ## Limits and known issues
 
-- **WebGPU only.** On WebGL2, keep a `CascadedShadowGenerator`;
-  `SundialBabylon.isSupported(engine)` tells you which.
+- **WebGPU only.** On WebGL2, keep a `CascadedShadowGenerator` (Babylon) or
+  three's own shadow maps; `isSupported` tells you which.
 - **One directional light.** Point and spot lights are out of scope.
-- **Receivers:** StandardMaterial and PBRMaterial in WGSL. Node materials and
-  custom shaders need the exported WGSL wired in by hand.
+- **Receivers:** Babylon: StandardMaterial and PBRMaterial in WGSL; node
+  materials and custom shaders need the exported WGSL wired in by hand.
+  three: every node material lit by the sun.
+- **three.js:** perspective cameras only for level selection (orthographic
+  cameras work but choose levels as if at 1 m); morph targets are not applied
+  to casters; the adapter has no registration memo yet, so `setCasters` re-hashes
+  every caster's geometry (clustering itself stays cached).
 - **Skinned casters:** linear blend skinning only. Morph targets are not
   applied (the shadow has the unmorphed shape), and neither is CPU skinning
   (`computeBonesUsingShaders = false`). At most 8 influences and 256 bones
@@ -294,8 +393,8 @@ Babylon team, awaiting merge:
 - **Private Babylon API** (see Seams): a Babylon upgrade can break the adapter.
   Babylon 9.17.1 is tested.
 
-Planned: level cross-fade, a three.js adapter, and a
-screen-space shadow mask as an engine-agnostic receiver.
+Planned: level cross-fade, and a screen-space shadow mask as an
+engine-agnostic receiver.
 
 ## Development
 

@@ -45,7 +45,7 @@ struct PsParams {
   grid: vec4u,    // x = level count, y = pages per window side, z = frame, w = render budget
   misc: vec4u,    // x = invalidation region count, y = cluster instance count, z = max pairs, w = cluster count
   invViewProj: mat4x4f, // camera clip -> world, for the frame whose depth is being marked
-  screen: vec4f,  // x = depth width, y = depth height, z = marking stride in pixels, w = 1 when depth is bound
+  screen: vec4f,  // x = depth width, y = depth height, z = marking stride in pixels, w = 1 when depth is bound (2: reversed-Z)
   shade: vec4f,   // x = darkness: light left in full shadow (0 = black, 1 = no shadow), as Babylon's setDarkness;
                   // y = 1 when psMinMax is live for every valid page (the receiver's PCF early-out);
                   // z = 1 to rotate the page-marking sample through its stride cell each frame (markRotate); w unused

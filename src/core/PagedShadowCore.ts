@@ -99,7 +99,16 @@ export interface FrameInput {
    * matrix it was rendered with (16 floats, column-major). Pages are requested
    * from it. Without it only the always-resident coarsest level is available.
    */
-  depth?: { texture: GPUTexture; invViewProj: ArrayLike<number> };
+  depth?: DepthInput;
+}
+
+/** A camera depth buffer to request pages from. */
+export interface DepthInput {
+  texture: GPUTexture;
+  /** Clip-to-world matrix it was rendered with (16 floats, column-major). */
+  invViewProj: ArrayLike<number>;
+  /** Reversed-Z (near = 1, far = 0), e.g. three.js with `reversedDepthBuffer`. Default false. */
+  reversed?: boolean;
 }
 
 export interface Tuning {
@@ -1383,7 +1392,7 @@ export class PagedShadowCore {
    * The requests are consumed by the next update(). Use this instead of
    * FrameInput.depth whenever the host lets you encode mid-frame.
    */
-  markInto(encoder: GPUCommandEncoder, depth: { texture: GPUTexture; invViewProj: ArrayLike<number> }): void {
+  markInto(encoder: GPUCommandEncoder, depth: DepthInput): void {
     if (!this.computeGroup) return;
     const bound = this.bindDepth(depth.texture);
     // writeBuffer copies at the call, so one block serves every frame.
@@ -1394,7 +1403,7 @@ export class PagedShadowCore {
     block[16] = depth.texture.width;
     block[17] = depth.texture.height;
     block[18] = this.markStride;
-    block[19] = 1;
+    block[19] = depth.reversed ? 2 : 1;
     this.device.queue.writeBuffer(this.paramsBuffer, 20 * 4, block);
     const mp = encoder.beginComputePass({
       label: "ps.mark",
@@ -1478,7 +1487,7 @@ export class PagedShadowCore {
       // At most 16: words 36.. are the depth size and stride.
       const n = Math.min(16, m.length);
       for (let k = 0; k < n; k++) f[20 + k] = m[k];
-      f[36] = input.depth.texture.width; f[37] = input.depth.texture.height; f[38] = this.markStride; f[39] = 1;
+      f[36] = input.depth.texture.width; f[37] = input.depth.texture.height; f[38] = this.markStride; f[39] = input.depth.reversed ? 2 : 1;
     } else {
       f[36] = 0; f[37] = 0; f[38] = this.markStride; f[39] = 0;
     }

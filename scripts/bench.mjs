@@ -10,6 +10,8 @@ import { join } from "node:path";
 
 const extra = process.argv[2] ?? "";
 const port = process.env.PORT ?? 5188;
+// PAGE=/three.html targets the three.js lab; default "/" is the Babylon lab.
+const pagePath = process.env.PAGE || "/";
 const sampleMs = Number(process.argv[3] ?? 3000);
 const rounds = Number(process.env.ROUNDS ?? 3);
 const root = join(process.env.LOCALAPPDATA, "ms-playwright");
@@ -40,7 +42,7 @@ let adapter = "";
 // transient state (measured: 23.8 vs 6.8 ms for the same page). Warm every
 // mode once, and load a cheap flush page before every measured run.
 const load = async (query, settle) => {
-  await page.goto(`http://localhost:${port}/?${query}`);
+  await page.goto(`http://localhost:${port}${pagePath}?${query}`);
   await page.waitForFunction(() => window.__ready === true, null, { timeout: 60000 });
   await page.waitForTimeout(settle);
 };

@@ -4,6 +4,23 @@ All notable changes to `@poqpoq/sundial`. The project follows
 [semantic versioning](https://semver.org/); while it is 0.x, a minor version
 may change the API.
 
+## Unreleased
+
+### three.js adapter (new)
+
+- `@poqpoq/sundial/three`: `SundialThree` for three r186 `WebGPURenderer`.
+  The receiver is the sun's `light.shadow.shadowNode` (Sundial's own receiver
+  WGSL, bound through three's binding system), so every node material lit by
+  the sun receives, and three renders no shadow map of its own for it.
+  Static, dynamic, `InstancedMesh`, alpha-tested (`map` / `alphaMap` at
+  `alphaTest`) and skinned (`SkinnedMesh`) casters; antialias,
+  `reversedDepthBuffer` and post-processing supported.
+- Both engines are now optional peer dependencies.
+
+### Core
+
+- Reversed-Z page marking: `DepthInput.reversed` (also exported as a type).
+
 ## 0.2.0 — 2026-09-24
 
 ### Core
