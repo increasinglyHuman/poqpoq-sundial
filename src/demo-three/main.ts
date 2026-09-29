@@ -1,5 +1,6 @@
 import * as THREE from "three/webgpu";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { pass } from "three/tsl";
 import { SundialThree } from "../three";
 
 // Minimal three.js scene for the adapter: ground, a row of boxes, a spinning
@@ -148,6 +149,10 @@ const errors: string[] = [];
 w.__errors = errors;
 (renderer.backend as unknown as { device: GPUDevice }).device.addEventListener("uncapturederror", (e) => errors.push((e as GPUUncapturedErrorEvent).error.message));
 
+// ?post=1: render through three's post-processing (a scene pass into its own
+// target, then a vignette-free passthrough), so marking must find that target's depth.
+const post = params.get("post") === "1" ? new THREE.RenderPipeline(renderer, pass(scene, camera)) : null;
+
 let frames = 0;
 let last = performance.now();
 renderer.setAnimationLoop((time) => {
@@ -155,7 +160,8 @@ renderer.setAnimationLoop((time) => {
   spinner.position.x = 4 + Math.sin(time * 0.0005) * 6;
   upper.rotation.z = params.get("bend") ? Number(params.get("bend")) : Math.sin(time * 0.0012) * 1.1;
   controls.update();
-  renderer.render(scene, camera);
+  if (post) post.render();
+  else renderer.render(scene, camera);
   frames++;
   const now = performance.now();
   if (now - last > 500) {
