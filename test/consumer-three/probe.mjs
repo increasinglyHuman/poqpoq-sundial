@@ -22,13 +22,20 @@ function evaluate(variant, res) {
   if (variant === "webgl") {
     return res.imported && !res.error && res.supported === false;
   }
+  if (variant === "webgpu&blend=1") {
+    // blendShadowMap: both shadows render, and where they cover the same
+    // ground the frame is no darker than Sundial alone (min, not a product);
+    // turning Sundial off leaves three's shadow, and back on restores the frame.
+    const b = res.blend;
+    return res.imported && !res.error && res.supported === true && res.gpuErrors.length === 0 && !!b &&
+      b.sundialOnly < b.none - 0.02 && b.nativeOnly < b.none - 0.02 &&
+      Math.abs(b.both - b.sundialOnly) < 0.35 * (b.none - b.sundialOnly) &&
+      Math.abs(b.back - b.both) < 0.002;
+  }
   if (variant !== "webgpu") {
     // aa=1 / tonemap=0 / nofeat=1 / reversed=1: a targeted smoke check, not
-    // the full battery — Sundial must still be supported, page real content,
-    // hit no GPU errors, and (for nofeat/aa/tonemap) that must all hold with
-    // no allocation failures. reversed=1 exercises a renderer option the
-    // currently-checked-out core does not yet know about (see below) so it
-    // only gets a no-crash/paging smoke check, not a correctness assertion.
+    // the full battery: Sundial must still be supported, page real content,
+    // hit no GPU errors, and hold with no allocation failures.
     const s = res.smoke;
     return res.imported && !res.error && res.supported === true && res.gpuErrors.length === 0 &&
       !!s && s.requestedPages > 0 && s.allocationFailures === 0;
@@ -126,7 +133,7 @@ function evaluate(variant, res) {
   return res.failed.length === 0;
 }
 
-for (const variant of ["webgl", "webgpu", "webgpu&aa=1", "webgpu&tonemap=0", "webgpu&nofeat=1", "webgpu&reversed=1"]) {
+for (const variant of ["webgl", "webgpu", "webgpu&aa=1", "webgpu&tonemap=0", "webgpu&nofeat=1", "webgpu&reversed=1", "webgpu&blend=1"]) {
   const p = await b.newPage({ viewport: { width: 700, height: 560 } });
   const errs = [];
   p.on("pageerror", (e) => errs.push(e.message));

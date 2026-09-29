@@ -15,8 +15,9 @@ const aa = params.get("aa") === "1";
 const tonemapOff = params.get("tonemap") === "0";
 const bare = params.get("nofeat") === "1";
 const reversed = params.get("reversed") === "1";
+const blend = params.get("blend") === "1";
 
-const r = (window.__result = { imported: true, variant: engineParam + (aa ? "&aa=1" : "") + (tonemapOff ? "&tonemap=0" : "") + (bare ? "&nofeat=1" : "") + (reversed ? "&reversed=1" : "") });
+const r = (window.__result = { imported: true, variant: engineParam + (aa ? "&aa=1" : "") + (tonemapOff ? "&tonemap=0" : "") + (bare ? "&nofeat=1" : "") + (reversed ? "&reversed=1" : "") + (blend ? "&blend=1" : "") });
 
 const SCENE_MIN = [-20, -1, -20];
 const SCENE_MAX = [20, 10, 20];
@@ -121,7 +122,7 @@ try {
     scene.add(leaf);
 
     // ---- Sundial ----------------------------------------------------------
-    const sundial = new SundialThree(renderer, scene, camera, sun, { sceneMin: SCENE_MIN, sceneMax: SCENE_MAX, levels: 5 });
+    const sundial = new SundialThree(renderer, scene, camera, sun, { sceneMin: SCENE_MIN, sceneMax: SCENE_MAX, levels: 5, blendShadowMap: blend });
     r.core = () => sundial.core.stats;
 
     // Render target for deterministic readback: an explicit off-screen
@@ -155,7 +156,44 @@ try {
     function hideExtras() { box.visible = prim.visible = leaf.visible = false; }
     function showExtras() { box.visible = prim.visible = leaf.visible = true; }
 
-    if (aa || tonemapOff || bare || reversed) {
+    if (blend) {
+      // ---- blendShadowMap: three's own shadow map folded in with min() -----
+      // A twin of the box on layer 1 (the "avatar"), cast only by three's map
+      // (its shadow camera sees layer 1 alone), exactly where Sundial casts
+      // the box: where both shadow the same ground, the frame must be no
+      // darker than Sundial alone (min, not a product). The Babylon twin is
+      // the csm=1 variant of the Babylon consumer test.
+      const AVATARS = 1;
+      const twin = new THREE.Mesh(box.geometry, mat);
+      twin.position.copy(box.position);
+      twin.layers.enable(AVATARS);
+      twin.castShadow = true;
+      scene.add(twin);
+      sun.shadow.camera.layers.set(AVATARS);
+      sun.shadow.mapSize.set(2048, 2048);
+      Object.assign(sun.shadow.camera, { left: -12, right: 12, top: 12, bottom: -12, near: 1, far: 80 });
+      sun.shadow.camera.updateProjectionMatrix();
+      hideExtras();
+      // Top-down over the box's shadow, which falls toward -x, +z.
+      aimTopDown(-4, 3, 7);
+      const settle = () => renderFrames(20);
+      await settle();
+      r.blend = { both: await meanLuma() };
+      twin.castShadow = false;
+      await settle();
+      r.blend.sundialOnly = await meanLuma();
+      sundial.setEnabled(false);
+      await settle();
+      r.blend.none = await meanLuma();
+      twin.castShadow = true;
+      await settle();
+      r.blend.nativeOnly = await meanLuma();
+      sundial.setEnabled(true);
+      await settle();
+      r.blend.back = await meanLuma();
+      r.core = () => sundial.core.stats;
+      r.done = true;
+    } else if (aa || tonemapOff || bare || reversed) {
       // ---- targeted variant smoke checks ----------------------------------
       // These variants are about one specific renderer configuration, not the
       // full battery below (which runs once, unconditionally, on plain

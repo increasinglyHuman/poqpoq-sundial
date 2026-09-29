@@ -30,7 +30,7 @@ import {
   type Texture,
   type WebGPURenderer,
 } from "three/webgpu";
-import { code, renderGroup, diffuseColor, float, materialAlphaTest, select, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
+import { code, min, renderGroup, shadow, diffuseColor, float, materialAlphaTest, select, vec3, faceDirection, normalWorldGeometry, positionWorld, storage, texture, uniform, wgslFn } from "three/tsl";
 import { PagedShadowCore, type InstanceGroup, type PagedShadowOptions, type Vec3 } from "../core/PagedShadowCore";
 import type { GeometryInput } from "../core/geometry";
 import type { SkinInput } from "../core/skin";
@@ -105,6 +105,18 @@ export interface SundialThreeOptions extends PagedShadowOptions {
    * unshadowed by this light, as `receiveShadow = false` does per mesh.
    */
   receiveMaterial?: (material: Material) => boolean;
+  /**
+   * Also shade the sun with three's own shadow map for this light, the darker
+   * of the two winning (min), so a caster in both never darkens twice: the
+   * three.js twin of folding a Babylon ShadowGenerator in. For casters Sundial
+   * does not cover well, such as many animated characters. three's map is
+   * configured as usual (`light.shadow.camera` bounds, `mapSize`, `bias`) and
+   * draws every mesh with `castShadow` that `light.shadow.camera.layers` sees:
+   * give those casters a layer of their own, and do not register them with
+   * Sundial as well. Chosen per light: the first instance to start on a light
+   * decides for as long as three keeps the materials' builds.
+   */
+  blendShadowMap?: boolean;
 }
 
 interface AlphaLayer {
@@ -326,7 +338,9 @@ class SundialShadowNode extends Node {
     const m = material as Material & { alphaTestNode?: Node | null; alphaToCoverage?: boolean };
     const cutoff = m.alphaToCoverage ? null : m.alphaTestNode ? float(m.alphaTestNode as never) : m.alphaTest > 0 ? materialAlphaTest : null;
     const on = cutoff ? select(diffuseColor.a.greaterThan(cutoff), r.enabled, float(0)) : r.enabled;
-    return (front ? r.front : r.any)({ posW: positionWorld, normalW: normal, on });
+    const factor = (front ? r.front : r.any)({ posW: positionWorld, normalW: normal, on });
+    // Off (setEnabled(false)) Sundial's factor is 1, so three's shadow alone remains.
+    return r.host.blendShadowMap ? min(factor as never, vec3(r.nativeShadow() as never)) : factor;
   }
 }
 
@@ -381,6 +395,13 @@ class Receiver {
     this.node = new SundialShadowNode(this);
   }
 
+  private native: Node | null = null;
+
+  /** three's own shadow node for this light (it renders the light's shadow map), made once. */
+  nativeShadow(): Node {
+    return (this.native ??= shadow(this.host.light) as unknown as Node);
+  }
+
   /** Point every binding at `host`'s resources. */
   bind(host: SundialThree, b: Bindings): void {
     if (this.host === host) return;
@@ -404,6 +425,8 @@ export class SundialThree {
   camera: Camera;
 
   /** @internal */ readonly receiveMaterial: (material: Material) => boolean;
+  /** See SundialThreeOptions.blendShadowMap. */
+  readonly blendShadowMap: boolean;
 
   private readonly bindings: Bindings;
   private receiver: Receiver | null = null;
@@ -448,6 +471,7 @@ export class SundialThree {
     this.camera = camera;
     this.light = light;
     this.receiveMaterial = options.receiveMaterial ?? (() => true);
+    this.blendShadowMap = !!options.blendShadowMap;
     const backend = backendOf(renderer);
     this.core = new PagedShadowCore(backend.device!, { maxAlphaLayers: 16, ...options });
 
@@ -498,13 +522,15 @@ export class SundialThree {
   /**
    * Every visible mesh under `root` with `castShadow`, as static casters
    * (SkinnedMeshes as dynamic, so they cast their pose). A convenience for
-   * scenes that already mark their casters the three.js way.
+   * scenes that already mark their casters the three.js way. `filter` leaves
+   * meshes out, e.g. with blendShadowMap the ones three's own map draws:
+   * `castersIn(scene, (m) => !m.layers.isEnabled(AVATARS))`.
    */
-  static castersIn(root: Object3D): CasterEntry[] {
+  static castersIn(root: Object3D, filter?: (mesh: Mesh) => boolean): CasterEntry[] {
     const out: CasterEntry[] = [];
     root.traverseVisible((o) => {
       const m = o as Mesh;
-      if (m.isMesh && m.castShadow) out.push((m as SkinnedMesh).isSkinnedMesh ? { mesh: m, options: { dynamic: true } } : m);
+      if (m.isMesh && m.castShadow && (!filter || filter(m))) out.push((m as SkinnedMesh).isSkinnedMesh ? { mesh: m, options: { dynamic: true } } : m);
     });
     return out;
   }

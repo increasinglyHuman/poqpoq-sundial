@@ -250,6 +250,14 @@ if (SundialThree.isSupported(renderer)) {                          // false on t
   and post-processing all work: marking reads the depth of whatever target
   the camera rendered into. `setEnabled(false)` is a uniform flip, with no
   shader recompile.
+- **Sharing the light with three's own shadow map.** `blendShadowMap: true`
+  also shades the sun with three's standard shadow map for that light, and the
+  darker of the two wins, so a caster in both never darkens twice (the same
+  `min()` the Babylon adapter uses with a `ShadowGenerator`). Use it for
+  casters Sundial doesn't suit, such as many animated characters: put them on
+  a layer of their own, point `sun.shadow.camera.layers` at it, size the
+  shadow camera as usual, and leave them out of Sundial
+  (`castersIn(scene, (m) => !m.layers.isEnabled(AVATARS))`).
 - `setDarkness`, `setSceneBounds`, `core.tuning`, `core.stats` and `dispose()`
   work as in the Babylon adapter.
 
