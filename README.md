@@ -6,8 +6,9 @@
 
 Sundial is a virtual (paged) shadow map for one directional light, written in
 TypeScript and WGSL for WebGPU. It has an engine-agnostic core that talks only
-to a `GPUDevice`, and a Babylon.js 9 adapter. It is the default shadow system
-of [poqpoq World](https://poqpoq.com/world/) on WebGPU.
+to a `GPUDevice`, a Babylon.js 9 adapter and a three.js adapter (r186
+`WebGPURenderer`). It is the default shadow system of
+[poqpoq World](https://poqpoq.com/world/) on WebGPU.
 
 **Sharper shadows near the camera, and on integrated GPUs, a lower cost than
 Babylon's cascaded shadow maps.** Measured on an Intel Xe-LPG iGPU, a frame
@@ -48,9 +49,11 @@ web: no mesh shaders, no bindless, and no engine changes.
 
 ### Status
 
-Version **0.2**. Running in production in poqpoq World since September 2026,
-on the default path for every WebGPU visitor; WebGL2 visitors keep CSM. The
-API may still change within 0.x (see [Limits](#limits-and-known-issues)).
+Version **0.3**, which adds the three.js adapter (`@poqpoq/sundial/three`).
+The Babylon adapter has been running in production in poqpoq World since
+September 2026, on the default path for every WebGPU visitor; WebGL2 visitors
+keep CSM. The API may still change within 0.x (see
+[Limits](#limits-and-known-issues)).
 
 ## Results
 
