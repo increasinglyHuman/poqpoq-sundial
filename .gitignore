@@ -2,6 +2,7 @@
 node_modules/
 dist/
 demo-dist/
+pages-dist/
 .vite/
 
 # local run artefacts

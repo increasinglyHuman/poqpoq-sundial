@@ -52,6 +52,7 @@
     "dev": "vite",
     "build": "vite build --config vite.lib.config.ts && tsc -p tsconfig.build.json",
     "build:demo": "tsc --noEmit && vite build",
+    "build:pages": "vite build --config vite.demo.config.ts",
     "typecheck": "tsc --noEmit",
     "test:consumer": "npm run build && cd test/consumer && npm install --no-audit --no-fund && node probe.mjs",
     "test:consumer-three": "node test/consumer-three/probe.mjs"

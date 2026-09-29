@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Sundial for three.js</title>
+    <meta name="description" content="Sundial: paged (virtual) sun shadow maps for three.js WebGPURenderer. A live demo: a 256 m forest and village with alpha-tested leaf shadows and skinned walkers." />
+    <meta property="og:title" content="Sundial for three.js: paged sun shadows on WebGPU" />
+    <meta property="og:description" content="A live demo of @poqpoq/sundial: virtual shadow maps for three.js WebGPURenderer." />
+    <meta property="og:image" content="https://increasinglyhuman.github.io/poqpoq-sundial/sundial-three.jpg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/svg+xml" href="./poqpoq.svg" />
+    <link rel="stylesheet" href="./showcase.css" />
+  </head>
+  <body>
+    <canvas id="view" aria-label="3D view: a forest and a village lit by a low sun"></canvas>
+
+    <header class="card intro">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="6.5" /><g><path d="M16 2.5v4M16 25.5v4M2.5 16h4M25.5 16h4M6.5 6.5l2.8 2.8M22.7 22.7l2.8 2.8M6.5 25.5l2.8-2.8M22.7 9.3l2.8-2.8" /></g></svg>
+        <h1>Sundial <span>for three.js</span></h1>
+        <a class="maker" href="https://poqpoq.com/world/" target="_blank" rel="noopener" title="Made by poqpoq, for poqpoq World">
+          <img src="./poqpoq.svg" alt="poqpoq" width="28" height="28" />
+        </a>
+      </div>
+      <p class="lede">
+        Paged (virtual) shadow maps for the sun on <code>WebGPURenderer</code>: shadow depth is drawn once into
+        128&times;128 pages at the resolution the screen needs, and kept until something moves.
+      </p>
+      <nav class="links">
+        <a href="https://github.com/increasinglyHuman/poqpoq-sundial" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://www.npmjs.com/package/@poqpoq/sundial" target="_blank" rel="noopener">npm</a>
+        <a href="https://github.com/increasinglyHuman/poqpoq-sundial#how-it-works" target="_blank" rel="noopener">How it works</a>
+        <a href="./examples/three-basic/" class="example-link">Minimal example</a>
+      </nav>
+    </header>
+
+    <aside class="card stats" id="stats" aria-live="off">
+      <div class="stat"><b id="fps">–</b><span>fps</span></div>
+      <div class="stat"><b id="ms">–</b><span>ms / frame</span></div>
+      <div class="stat wide" id="pagesStat"><b id="pages">–</b><span>pages resident</span></div>
+      <div class="gpu" id="gpu">starting WebGPU…</div>
+    </aside>
+
+    <section class="card controls" id="controls" aria-label="Demo controls">
+      <div class="row">
+        <div class="segmented" role="radiogroup" aria-label="Shadow technique">
+          <button role="radio" data-mode="sundial" aria-checked="true">Sundial</button>
+          <button role="radio" data-mode="csm" aria-checked="false" title="three.js CSMShadowNode, 3 cascades of 2048²">three.js CSM</button>
+          <button role="radio" data-mode="off" aria-checked="false">Off</button>
+        </div>
+        <label class="toggle" title="Tint each clipmap level of the page table">
+          <input type="checkbox" id="levels" /> <span>levels</span>
+        </label>
+      </div>
+      <div class="row time">
+        <button class="play" id="play" aria-label="Animate the sun" aria-pressed="false">
+          <svg viewBox="0 0 24 24" class="icon-play" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z" /></svg>
+          <svg viewBox="0 0 24 24" class="icon-pause" aria-hidden="true"><path d="M7 5h3.6v14H7zM13.4 5H17v14h-3.6z" /></svg>
+        </button>
+        <input type="range" id="time" min="0" max="1" step="0.001" aria-label="Time of day" />
+        <output id="clock">16:30</output>
+      </div>
+      <div class="row presets" role="group" aria-label="Views">
+        <button data-view="forest">Forest floor</button>
+        <button data-view="village">Village street</button>
+        <button data-view="detail">Close-up</button>
+        <button data-view="overview">Overview</button>
+      </div>
+    </section>
+
+    <footer class="credit">
+      Built with <a href="https://threejs.org" target="_blank" rel="noopener">three.js</a> WebGPURenderer · drag to orbit, scroll to zoom
+    </footer>
+
+    <div class="fallback" id="fallback" hidden>
+      <img src="./sundial-three.jpg" alt="Screenshot of the demo: dappled sun shadows under a forest canopy" />
+      <div class="card fallback-card">
+        <h2>This demo needs WebGPU</h2>
+        <p>
+          Sundial runs on three.js <code>WebGPURenderer</code> with its WebGPU backend, which this browser does not
+          provide. Try Chrome or Edge 113+, Safari 26, or Firefox 141+ on Windows. Behind this note is a screenshot of
+          the live demo.
+        </p>
+        <p class="fallback-links">
+          <a href="https://github.com/increasinglyHuman/poqpoq-sundial" target="_blank" rel="noopener">GitHub</a> ·
+          <a href="https://www.npmjs.com/package/@poqpoq/sundial" target="_blank" rel="noopener">npm</a> ·
+          <a href="https://github.com/increasinglyHuman/poqpoq-sundial#how-it-works" target="_blank" rel="noopener">How it works</a>
+        </p>
+      </div>
+    </div>
+
+    <script type="module" src="/src/showcase/main.ts"></script>
+  </body>
+</html>
