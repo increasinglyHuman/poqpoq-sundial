@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sundial three.js Lab</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0e12; color: #e8edf3; overflow: hidden;
+        font: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+      #view { width: 100vw; height: 100vh; display: block; }
+      #hud { position: fixed; top: 12px; left: 12px; background: rgba(12,16,22,0.78); padding: 10px 12px; border-radius: 8px; }
+      #stats { white-space: pre; margin: 0 0 8px; }
+      button { background: #1f2833; color: #e8edf3; border: 1px solid #334155; border-radius: 5px; padding: 3px 9px; font: inherit; cursor: pointer; }
+      button.on { background: #f5c46b; color: #111; }
+    </style>
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+    <div id="hud"><pre id="stats">starting WebGPU…</pre>
+      <button id="toggle" class="on">sundial</button> <button id="debug">levels</button></div>
+    <script type="module" src="/src/demo-three/main.ts"></script>
+  </body>
+</html>
