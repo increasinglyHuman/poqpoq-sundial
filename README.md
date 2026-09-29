@@ -95,6 +95,25 @@ static depth, instead of every tree and prim under it:
 | village, 8 skinned walkers | 0.07 ms | 0.25 ms |
 | static scene | 0.01–0.02 ms | 0.00 ms |
 
+**three.js (0.3).** The same scene in the three.js lab (`three.html`: three
+r186 `WebGPURenderer`, 4× MSAA, 1600×900), against three's own
+`CSMShadowNode` at the same cascade counts and map sizes. Median of 3
+interleaved rounds of 3 s, taken 2026-09-28; the Xe-LPG was in its fast state
+(shadows off 3.84 ms, the same as the Babylon lab that session).
+
+Frame time in ms (lower is better):
+
+| | Xe-LPG village | Xe-LPG overview | Xe-LPG forest | RTX 5060 village | RTX 5060 overview | RTX 5060 forest |
+|---|---|---|---|---|---|---|
+| shadows off | 3.84 | 3.96 | 3.53 | 1.08 | 1.34 | 1.00 |
+| CSMShadowNode 3×2048² | 7.08 | 6.76 | 6.62 | 2.96 | 3.47 | 3.17 |
+| CSMShadowNode 4×4096² | 10.77 | 9.92 | 9.98 | 8.46 | 6.57 | 7.07 |
+| **Sundial** | **6.43** | **6.69** | **5.89** | **2.56** | **3.36** | **2.33** |
+
+Sundial's own passes cost the same as under Babylon (marking 0.3–0.4 ms on
+the Xe-LPG, paging and static raster ~0.04 ms). In the same session the
+Babylon lab's Sundial frame was 7.11 / 7.41 / 6.24 ms on the Xe-LPG.
+
 ## Using it
 
 ```
