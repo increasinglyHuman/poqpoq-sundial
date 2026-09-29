@@ -9,5 +9,5 @@
     "rootDir": "src",
     "types": ["@webgpu/types"]
   },
-  "include": ["src/index.ts", "src/core", "src/babylon"]
+  "include": ["src/index.ts", "src/core", "src/babylon", "src/three"]
 }

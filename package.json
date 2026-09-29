@@ -1,13 +1,14 @@
 {
   "name": "@poqpoq/sundial",
   "version": "0.2.0",
-  "description": "Sundial: paged (virtual) sun shadows for WebGPU — engine-agnostic core, Babylon.js adapter, benchmark lab",
+  "description": "Sundial: paged (virtual) sun shadows for WebGPU \u2014 engine-agnostic core, Babylon.js and three.js adapters, benchmark lab",
   "keywords": [
     "webgpu",
     "shadows",
     "virtual-shadow-maps",
     "shadow-mapping",
     "babylonjs",
+    "threejs",
     "wgsl",
     "rendering"
   ],
@@ -33,6 +34,10 @@
     "./babylon": {
       "types": "./dist/babylon/index.d.ts",
       "import": "./dist/babylon.js"
+    },
+    "./three": {
+      "types": "./dist/three/index.d.ts",
+      "import": "./dist/three.js"
     }
   },
   "files": [
@@ -51,7 +56,16 @@
     "test:consumer": "npm run build && cd test/consumer && npm install --no-audit --no-fund && node probe.mjs"
   },
   "peerDependencies": {
-    "@babylonjs/core": "^9.17.1"
+    "@babylonjs/core": "^9.17.1",
+    "three": ">=0.186.0 <0.188.0"
+  },
+  "peerDependenciesMeta": {
+    "@babylonjs/core": {
+      "optional": true
+    },
+    "three": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@babylonjs/core": "9.17.1",
