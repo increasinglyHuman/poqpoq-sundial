@@ -27,6 +27,8 @@ at 4×4096²). Its finest texels are 7.8 mm.
 (needs a WebGPU browser) · get started: [Babylon.js](#using-it) ·
 [three.js](#threejs) · [results](#results)
 
+If Sundial helps your project, a ⭐ on the repo helps other WebGPU developers find it.
+
 ## About
 
 ### Why it exists
