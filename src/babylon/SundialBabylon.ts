@@ -378,6 +378,16 @@ interface DepthSnapshot {
  * objects once and caches them, so edits made through the buffer plus
  * `thinInstanceBufferUpdated()` never show up there.
  */
+/** WebGPU formats a depth view (aspect "depth-only") can be made of. Anything else must never reach markInto. */
+const DEPTH_FORMATS = new Set(["depth16unorm", "depth24plus", "depth24plus-stencil8", "depth32float", "depth32float-stencil8"]);
+
+/** True when `texture` is a real depth texture. Exported for tests. */
+export function isDepthTexture(texture: { format?: string } | null | undefined): boolean {
+  return !!texture && typeof texture.format === "string" && DEPTH_FORMATS.has(texture.format);
+}
+
+const NO_DEPTH = Symbol("no-depth");
+
 /**
  * The depth buffer a camera's geometry actually lands in. A camera with an
  * output render target, or with post-processes (World's world camera renders
@@ -386,7 +396,7 @@ interface DepthSnapshot {
  * for the far plane only. Null when that depth cannot be sampled, so the caller
  * can fall back to the main buffer.
  */
-function cameraDepth(camera: Camera, scene: Scene): GPUTexture | null {
+function cameraDepth(camera: Camera, scene: Scene): GPUTexture | typeof NO_DEPTH | null {
   const cam = camera as Camera & { _getFirstPostProcess?: () => { inputTexture?: RenderTargetWrapper } | null };
   const target =
     camera.outputRenderTarget?.renderTarget ??
@@ -395,7 +405,11 @@ function cameraDepth(camera: Camera, scene: Scene): GPUTexture | null {
   if (!target) return null;
   const texture = (target._depthStencilTexture?._hardwareTexture as { underlyingResource?: GPUTexture } | null | undefined)
     ?.underlyingResource;
-  return texture && texture.usage & GPUTextureUsage.TEXTURE_BINDING ? texture : null;
+  if (!texture || !(texture.usage & GPUTextureUsage.TEXTURE_BINDING)) return null;
+  // A caller-owned target can carry a colour-format "depth" (a World place picture: r32float). Binding
+  // that as DepthOnly invalidates the host's whole command encoder at submit — the frame is lost. This
+  // camera has no depth we can sample this frame: say so, and do NOT fall back to the main buffer.
+  return isDepthTexture(texture) ? texture : NO_DEPTH;
 }
 
 function casterMatrices(mesh: Mesh, instances?: Float32Array): Float32Array {
@@ -897,7 +911,9 @@ export class SundialBabylon {
 
   /** The depth this camera rendered into: its own target's, else Babylon's main one. */
   private depthOf(camera: Camera): GPUTexture | undefined {
-    return cameraDepth(camera, this.scene) ?? (this.scene.getEngine() as unknown as { _depthTexture?: GPUTexture })._depthTexture;
+    const own = cameraDepth(camera, this.scene);
+    if (own === NO_DEPTH) return undefined;
+    return own ?? (this.scene.getEngine() as unknown as { _depthTexture?: GPUTexture })._depthTexture;
   }
 
   private update(): void {
