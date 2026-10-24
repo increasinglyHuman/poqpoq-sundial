@@ -1206,7 +1206,9 @@ psCur = 1.0;
   }
 }
 
-/** Can this mesh still be read as a caster: not disposed, with positions and indices. */
+/** Can this mesh still be read as a caster: not disposed, with a position buffer that holds data, and indices. */
 function hasCastableGeometry(mesh: Mesh): boolean {
-  return !mesh.isDisposed() && !!mesh.getVerticesData(VertexBuffer.PositionKind) && !!mesh.getIndices();
+  // Presence only: getVerticesData() would COPY (and convert) an interleaved or non-float buffer on every rebuild, even on a
+  // registration-memo hit. The buffer's own data reference and the index array say the same without that work.
+  return !mesh.isDisposed() && !!mesh.getVertexBuffer(VertexBuffer.PositionKind)?.getData() && !!mesh.getIndices();
 }
