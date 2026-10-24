@@ -62,6 +62,8 @@ for (const engine of ["webgl2", "webgpu", "webgpu&pp=1", "webgpu&nofeat=1", "web
       res.moveApi.lumaMoved > res.moveApi.lumaPosts + 0.05 && res.moveApi.internalBuilds === 1 &&
       Math.abs(res.moveApi.lumaInternal - res.moveApi.lumaMoved) < 0.02 &&
       res.moveApi.refusedCount && res.moveApi.refusedUnregistered &&
+      // a caster that lost its geometry is dropped with ONE error and the frame keeps rendering (never a throw)
+      res.lostGeometry?.framesAfter === true && res.lostGeometry.logged === 1 && res.lostGeometry.other.length === 0 &&
       Math.abs(res.moveApi.lumaBack - res.moveApi.lumaPosts) < 0.02 &&
       // requests are per frame: empty sky requests fewer pages than the ground, and they come back
       res.requestedSky < res.requestedGround && res.requestedBack >= res.requestedGround - 2 &&

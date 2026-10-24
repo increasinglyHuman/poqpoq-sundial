@@ -586,7 +586,23 @@ export class SundialBabylon {
     this.dynamics.length = 0;
     this.statics.clear();
     this.core.clearContent();
-    const groups = this.entries.map((e) => this.register(e.mesh, e.options ?? {}));
+    // A caster that has LOST its geometry since it was registered (disposed, or its vertex data released, as a
+    // host's batching does mid-flight) is dropped, with one loud error naming it, never thrown: this runs inside the
+    // scene's render observer, and a throw there stops the frame (poqpoq World, 2026-10-24). Dropped from the entries,
+    // so it is reported once; registering it again brings it back. The result keeps the entries' order (an empty
+    // group list where one was dropped), as setCasters callers index it.
+    const kept: { mesh: Mesh; options?: CasterOptions }[] = [];
+    const groups = this.entries.map((e) => {
+      if (!hasCastableGeometry(e.mesh)) {
+        console.error(
+          `Sundial: dropped caster ${e.mesh.name}: it has no geometry (disposed, or its vertex data was released). It casts nothing until it is registered again.`,
+        );
+        return [];
+      }
+      kept.push(e);
+      return this.register(e.mesh, e.options ?? {});
+    });
+    this.entries = kept;
     if (this.running) this.core.build({ internal });
     return groups;
   }
@@ -1188,4 +1204,11 @@ psCur = 1.0;
     code["!aggShadow\\+=shadow;"] = "shadow=min(shadow,psCur);aggShadow+=shadow;";
     return code;
   }
+}
+
+/** Can this mesh still be read as a caster: not disposed, with a position buffer that holds data, and indices. */
+function hasCastableGeometry(mesh: Mesh): boolean {
+  // Presence only: getVerticesData() would COPY (and convert) an interleaved or non-float buffer on every rebuild, even on a
+  // registration-memo hit. The buffer's own data reference and the index array say the same without that work.
+  return !mesh.isDisposed() && !!mesh.getVertexBuffer(VertexBuffer.PositionKind)?.getData() && !!mesh.getIndices();
 }
