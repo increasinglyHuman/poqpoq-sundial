@@ -233,6 +233,28 @@ try {
         sd.verifyRegistrationMemo = false;
         sd.setCasters(base); posts.dispose(); dummy.dispose(); await frames(10);
       }
+      // A registered caster LOSES its geometry (a host's batch released mid-flight, poqpoq World 2026-10-24): the
+      // next rebuild runs inside the render observer and must drop it with ONE console.error, never throw (a throw
+      // there stopped the frame: the probe would see a pageerror and frames() would never resolve). The page keeps
+      // the deliberate error out of the probe's console check and counts it instead.
+      {
+        const base = [ground, box, { mesh: prim }, leaf];
+        const lost = MeshBuilder.CreateBox("lost-geometry", { size: 1 }, scene); lost.position.set(0, -0.5, 0); lost.layerMask = 0x10000000;
+        sd.setCasters([...base, lost]); await frames(10);
+        const logged = []; const realError = console.error;
+        console.error = (...args) => { logged.push(String(args[0])); };
+        try {
+          lost.geometry.releaseForMesh(lost, true);
+          const trigger = MeshBuilder.CreateBox("lost-trigger", { size: 0.1 }, scene); trigger.position.set(0, -0.5, 0); trigger.layerMask = 0x10000000;
+          sd.addCaster(trigger); await frames(10); // the internal rebuild happens in the render observer
+          sd.addCaster(trigger); await frames(10); // and again: the dropped caster is not reported twice
+          r.lostGeometry = { framesAfter: true, logged: logged.filter((m) => m.includes("lost-geometry")).length, other: logged.filter((m) => !m.includes("lost-geometry")) };
+          sd.setCasters(base); trigger.dispose();
+        } finally {
+          console.error = realError;
+        }
+        lost.dispose(); await frames(5);
+      }
       // A moving dynamic caster's shadow follows it (updateDynamics skips casters whose world matrix
       // provably did not change, so every way of moving one must still be seen). Hidden from the camera,
       // so only its shadow changes the picture: it lands in the left half at A = (-5, y, -8) and in the

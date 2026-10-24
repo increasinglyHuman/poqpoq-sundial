@@ -4,6 +4,16 @@ All notable changes to `@poqpoq/sundial`. The project follows
 [semantic versioning](https://semver.org/); while it is 0.x, a minor version
 may change the API.
 
+## 0.4.1 — 2026-10-24
+
+### Babylon adapter
+
+- A registered caster that has **lost its geometry** (disposed, or its vertex data released, as a
+  host's batching can do mid-flight) is now dropped at the next rebuild with one `console.error`
+  naming it, instead of throwing. The rebuild runs inside the scene's render observer, so the
+  throw stopped the frame (poqpoq World, 2026-10-24). Registering the mesh again brings it back.
+  `setCasters()` keeps its result aligned with the entries (an empty list for a dropped one).
+
 ## 0.4.0 — 2026-09-29
 
 ### three.js adapter
